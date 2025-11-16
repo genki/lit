@@ -36,6 +36,8 @@ mod proto {
     tonic::include_proto!("lit.relay.v1");
 }
 
+mod mount;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lit",
@@ -350,6 +352,7 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     }
     move_existing_contents(&canonical_target, &lower)?;
     write_workspace_marker(&lower, &workspace_id)?;
+    hydrate_upper_from_lower(&lower, &upper)?;
     write_workspace_config(
         &workspace_root,
         &canonical_target,
@@ -359,7 +362,14 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
         &work,
     )?;
 
-    spawn_lit_fs_daemon(&lower, &canonical_target)?;
+    spawn_lit_fs_daemon(&upper, &canonical_target)?;
+    mount::write_state(
+        &workspace_root,
+        &mount::MountState {
+            lower: lower.clone(),
+            mountpoint: canonical_target.clone(),
+        },
+    )?;
     wait_for_mount(&canonical_target).await?;
     println!(
         "lit: mounted workspace {} at {}",
@@ -384,8 +394,7 @@ async fn run_off(args: OffArgs) -> anyhow::Result<()> {
     if !workspace_root.exists() {
         return Err(anyhow!("{} is not a lit workspace", canonical.display()));
     }
-    let lower = workspace_root.join("lower");
-    sync_mountpoint_to_lower(&canonical, &lower)?;
+    let upper = workspace_root.join("upper");
     let status = Command::new("fusermount3")
         .arg("-u")
         .arg(&canonical)
@@ -398,7 +407,8 @@ async fn run_off(args: OffArgs) -> anyhow::Result<()> {
             canonical.display()
         ));
     }
-    sync_lower_to_target(&lower, &canonical)?;
+    sync_upper_to_target(&upper, &canonical)?;
+    mount::clear_state(&workspace_root)?;
     println!("lit: unmounted {}", canonical.display());
     Ok(())
 }
@@ -449,6 +459,7 @@ struct WorkspaceContext {
     mountpoint: PathBuf,
     workspace_id: String,
     root: PathBuf,
+    lower: PathBuf,
 }
 
 async fn workspace_context_from_arg(path: Option<PathBuf>) -> anyhow::Result<WorkspaceContext> {
@@ -466,10 +477,12 @@ async fn workspace_context_from_mount(mountpoint: PathBuf) -> anyhow::Result<Wor
     if !root.exists() {
         Err(anyhow!("{} is not a lit workspace", mountpoint.display()))
     } else {
+        let lower = root.join("lower");
         Ok(WorkspaceContext {
             mountpoint,
             workspace_id,
             root,
+            lower,
         })
     }
 }
@@ -530,7 +543,20 @@ fn copy_recursive(source: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_lower_snapshot(lower: &Path, target: &Path) -> anyhow::Result<()> {
+    if lower.exists() && lower.read_dir()?.next().is_some() {
+        // already has content
+        return Ok(());
+    }
+    clear_directory_contents(lower)?;
+    copy_dir_contents(target, lower)
+}
+
 fn copy_dir_contents(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if !src.exists() {
+        std::fs::create_dir_all(dest)?;
+        return Ok(());
+    }
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -538,6 +564,25 @@ fn copy_dir_contents(src: &Path, dest: &Path) -> anyhow::Result<()> {
         copy_recursive(&entry.path(), &child_dest)?;
     }
     Ok(())
+}
+
+fn ensure_lower_entry(lower_root: &Path, mount_root: &Path, rel: &str) -> anyhow::Result<()> {
+    let src = mount_root.join(rel);
+    let dst = lower_root.join(rel);
+    if dst.exists() {
+        return Ok(());
+    }
+    if src.is_dir() {
+        copy_dir_contents(&src, &dst)
+    } else if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&src, &dst)?;
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 fn clear_directory_contents(path: &Path) -> anyhow::Result<()> {
@@ -557,16 +602,14 @@ fn clear_directory_contents(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sync_lower_to_target(lower: &Path, target: &Path) -> anyhow::Result<()> {
-    clear_directory_contents(target)?;
-    copy_dir_contents(lower, target)
+fn hydrate_upper_from_lower(lower: &Path, upper: &Path) -> anyhow::Result<()> {
+    clear_directory_contents(upper)?;
+    copy_dir_contents(lower, upper)
 }
 
-fn sync_mountpoint_to_lower(mountpoint: &Path, lower: &Path) -> anyhow::Result<()> {
-    if lower.exists() {
-        std::fs::remove_dir_all(lower)?;
-    }
-    copy_dir_contents(mountpoint, lower)
+fn sync_upper_to_target(upper: &Path, target: &Path) -> anyhow::Result<()> {
+    clear_directory_contents(target)?;
+    copy_dir_contents(upper, target)
 }
 
 fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
@@ -660,6 +703,7 @@ async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     for path in args.paths {
         let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
         if add {
+            ensure_lower_entry(&ctx.lower, &ctx.mountpoint, &rel)?;
             if watch.insert(rel.clone()) {
                 println!("added {rel}");
             } else {
@@ -735,6 +779,7 @@ fn crdt_doc_path(root: &Path, rel: &str) -> PathBuf {
 async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let watch = load_watchlist(&ctx.root)?;
+    ensure_lower_snapshot(&ctx.lower, &ctx.mountpoint)?;
     let targets: Vec<String> = if let Some(path) = args.path {
         let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
         if !watch.contains(&rel) {
@@ -755,8 +800,9 @@ async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     let mut output = String::new();
     for rel in targets {
         update_crdt_document(&ctx, &rel)?;
+        ensure_lower_entry(&ctx.lower, &ctx.mountpoint, &rel)?;
         let mount_path = ctx.mountpoint.join(&rel);
-        let lower_path = ctx.root.join("lower").join(&rel);
+        let lower_path = ctx.lower.join(&rel);
         let diff = generate_diff(&lower_path, &mount_path)?;
         if diff.is_empty() {
             output.push_str(&format!("diff -- lit {rel}: no changes\n\n"));
