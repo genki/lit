@@ -1,10 +1,18 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use dirs::home_dir;
+use hex::ToHex;
 use mime_guess::MimeGuess;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -35,6 +43,8 @@ enum Commands {
     Sync(SyncArgs),
     /// Fetch a blob version
     BlobFetch(BlobFetchArgs),
+    /// Initialize and mount a workspace via FUSE overlay
+    Init(InitArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -67,6 +77,12 @@ struct BlobFetchArgs {
     output: PathBuf,
 }
 
+#[derive(clap::Args, Debug)]
+struct InitArgs {
+    /// Target directory to initialize (defaults to current directory)
+    path: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -77,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Sync(args) => run_sync(args).await?,
         Commands::BlobFetch(args) => run_blob_fetch(args).await?,
+        Commands::Init(args) => run_init(args).await?,
     }
     Ok(())
 }
@@ -219,4 +236,150 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+async fn run_init(args: InitArgs) -> anyhow::Result<()> {
+    let target = match args.path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let canonical_target = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    ensure_dir(&canonical_target).await?;
+    ensure_fuse_overlayfs()?;
+
+    let lit_home = lit_home_dir()?;
+    let workspaces_root = lit_home.join("workspaces");
+    fs::create_dir_all(&workspaces_root).await?;
+
+    let workspace_id = workspace_id(&canonical_target).await?;
+    let workspace_root = workspaces_root.join(&workspace_id);
+    let lower = workspace_root.join("lower");
+    let upper = workspace_root.join("upper");
+    let work = workspace_root.join("work");
+    fs::create_dir_all(&lower).await?;
+    fs::create_dir_all(&upper).await?;
+    fs::create_dir_all(&work).await?;
+
+    move_existing_contents(&canonical_target, &lower)?;
+    write_workspace_marker(&lower, &workspace_id)?;
+    write_workspace_config(
+        &workspace_root,
+        &canonical_target,
+        &workspace_id,
+        &lower,
+        &upper,
+        &work,
+    )?;
+
+    mount_overlay(&canonical_target, &lower, &upper, &work)?;
+    // Give the daemon a moment to mount before exiting
+    sleep(Duration::from_millis(500)).await;
+    println!(
+        "lit: mounted workspace {} at {}",
+        workspace_id,
+        canonical_target.to_string_lossy()
+    );
+    println!(
+        "Unmount with: fusermount3 -u {}",
+        canonical_target.to_string_lossy()
+    );
+    Ok(())
+}
+
+async fn ensure_dir(path: &Path) -> anyhow::Result<()> {
+    if !tokio::fs::metadata(path).await?.is_dir() {
+        return Err(anyhow!("{} is not a directory", path.display()));
+    }
+    Ok(())
+}
+
+fn ensure_fuse_overlayfs() -> anyhow::Result<()> {
+    which::which("fuse-overlayfs")
+        .map(|_| ())
+        .map_err(|_| anyhow!("fuse-overlayfs not found; install fuse-overlayfs package"))
+}
+
+async fn workspace_id(path: &Path) -> anyhow::Result<String> {
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or(path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    Ok(hasher.finalize().encode_hex::<String>())
+}
+
+fn lit_home_dir() -> anyhow::Result<PathBuf> {
+    let home = home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+    let lit_home = home.join(".lit");
+    std::fs::create_dir_all(&lit_home)?;
+    Ok(lit_home)
+}
+
+fn move_existing_contents(source: &Path, lower: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let dest = lower.join(&name);
+        std::fs::create_dir_all(dest.parent().unwrap_or(lower))?;
+        std::fs::rename(entry.path(), &dest).map_err(|err| {
+            anyhow!(
+                "failed to move {} to {}: {}",
+                entry.path().display(),
+                dest.display(),
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
+    let marker_dir = lower.join(".lit");
+    std::fs::create_dir_all(&marker_dir)?;
+    let marker = marker_dir.join("workspace.json");
+    let data = json!({ "workspace_id": workspace_id });
+    std::fs::write(marker, serde_json::to_vec_pretty(&data)?)?;
+    Ok(())
+}
+
+fn write_workspace_config(
+    root: &Path,
+    mountpoint: &Path,
+    workspace_id: &str,
+    lower: &Path,
+    upper: &Path,
+    work: &Path,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let config_path = root.join("workspace.json");
+    let payload = json!({
+        "workspace_id": workspace_id,
+        "mountpoint": mountpoint,
+        "lower": lower,
+        "upper": upper,
+        "work": work
+    });
+    let mut file = File::create(config_path)?;
+    file.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())?;
+    Ok(())
+}
+
+fn mount_overlay(mountpoint: &Path, lower: &Path, upper: &Path, work: &Path) -> anyhow::Result<()> {
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={},auto_unmount",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    let status = Command::new("fuse-overlayfs")
+        .arg("-o")
+        .arg(opts)
+        .arg(mountpoint)
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn fuse-overlayfs: {e}"))?;
+    drop(status); // daemonizes on its own
+    Ok(())
 }
