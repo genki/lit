@@ -41,6 +41,36 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 - 障害時再接続:
   - クライアントは再接続時に`OpenSession`で前回セッションIDと最後にACKされた操作IDを提示。Relayは欠落操作のみ再送要求して冪等性を維持する。
 
+### Proto定義(抜粋)
+```proto
+syntax = "proto3";
+package lit.relay.v1;
+
+message VersionVector { repeated Entry entries = 1; message Entry { string replica_id = 1; int64 counter = 2; } }
+message OpenSessionRequest { string node_id = 1; string host = 2; string crdt_version = 3; VersionVector local_vector = 4; }
+message OpenSessionResponse { string session_id = 1; VersionVector relay_vector = 2; repeated string missing_log_ranges = 3; }
+
+message OperationEnvelope {
+  string session_id = 1;
+  oneof payload {
+    Operation op = 2;
+    SnapshotMeta snapshot = 3;
+    Label label = 4;
+  }
+  bytes checksum = 5;
+}
+message Ack { string session_id = 1; uint64 last_applied_op = 2; string error = 3; }
+
+service RelayService {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc StreamOps(stream OperationEnvelope) returns (stream Ack);
+  rpc FetchSnapshot(FetchSnapshotRequest) returns (stream SnapshotChunk);
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+```
+※詳細protoは`proto/relay.proto`で管理し、`prost`でRustコードを生成する。
+
 ## システム要件
 - **FUSE互換実装**: ユーザ空間で動作し、POSIXファイル操作(オープン/クローズ/リード/ライト/renameなど)やメタデータ操作(chmod/chown/utimens、ディレクトリ作成/削除、シンボリックリンク/ハードリンク、拡張属性)を余さずフックしてイベントを取得する。
 - **マウントターゲット**: 任意の既存ディレクトリに`lit mount <path>`のような形でマウントし、アンマウント時もデータを失わない。
