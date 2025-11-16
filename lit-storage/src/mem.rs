@@ -2,7 +2,7 @@ use crate::{StorageBackend, StorageError, StorageResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-tokio::sync::RwLock;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Default)]
 pub struct MemBackend {

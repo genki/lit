@@ -1,8 +1,8 @@
 use crate::{StorageBackend, StorageConfig, StorageError, StorageResult};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
-tokio::fs::{self, File};
-tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
+use tokio::fs::{self, File};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
 pub struct FsBackend {
@@ -76,6 +76,7 @@ impl StorageBackend for FsBackend {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::StorageError;
 
     #[tokio::test]
     async fn roundtrip_put_get_delete() {
