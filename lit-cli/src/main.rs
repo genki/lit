@@ -408,7 +408,7 @@ fn write_workspace_config(
 
 fn mount_overlay(mountpoint: &Path, lower: &Path, upper: &Path, work: &Path) -> anyhow::Result<()> {
     let opts = format!(
-        "lowerdir={},upperdir={},workdir={},auto_unmount",
+        "lowerdir={},upperdir={},workdir={}",
         lower.display(),
         upper.display(),
         work.display()
