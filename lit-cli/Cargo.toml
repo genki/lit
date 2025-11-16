@@ -1,0 +1,28 @@
+[package]
+name = "lit-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI frontend for the lit filesystem"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[[bin]]
+name = "lit"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+whoami = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"

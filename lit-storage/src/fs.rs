@@ -53,21 +53,36 @@ impl StorageBackend for FsBackend {
     }
 
     async fn list_objects(&self, prefix: &str) -> StorageResult<Vec<String>> {
-        let base = self.resolve(prefix);
         let mut entries = Vec::new();
-        if !base.exists() {
+        let search_root = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.resolve(prefix)
+        };
+        if !search_root.exists() {
             return Ok(entries);
         }
-        let mut dir = fs::read_dir(base).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .unwrap_or(entry.path().as_path())
-                .to_string_lossy()
-                .to_string();
-            entries.push(rel);
+        let mut stack = vec![search_root];
+        while let Some(path) = stack.pop() {
+            let mut dir = fs::read_dir(&path).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let metadata = entry.metadata().await?;
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                } else if metadata.is_file() {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&self.root)
+                        .unwrap_or(entry.path().as_path())
+                        .to_string_lossy()
+                        .to_string();
+                    if prefix.is_empty() || rel.starts_with(prefix) {
+                        entries.push(rel);
+                    }
+                }
+            }
         }
+        entries.sort();
         Ok(entries)
     }
 }
@@ -75,8 +90,8 @@ impl StorageBackend for FsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::StorageError;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn roundtrip_put_get_delete() {

@@ -50,6 +50,10 @@ mod tests {
         let backend = MemBackend::default();
         backend.put_object("logs/1", b"abc").await.unwrap();
         assert_eq!(backend.get_object("logs/1").await.unwrap(), b"abc");
-        assert!(backend.list_objects("logs").await.unwrap().contains(&"logs/1".to_string()));
+        assert!(backend
+            .list_objects("logs")
+            .await
+            .unwrap()
+            .contains(&"logs/1".to_string()));
     }
 }

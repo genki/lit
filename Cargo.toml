@@ -1,5 +1,5 @@
 [workspace]
-members = ["lit-relay",
+members = ["lit-cli","lit-relay",
     "lit-storage"
 ]
 resolver = "2"

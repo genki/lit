@@ -8,14 +8,15 @@ use futures::StreamExt;
 use lit_storage::{FsBackend, StorageBackend, StorageConfig, StorageError};
 use prost::Message;
 use tokio::sync::RwLock;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{service::Interceptor, transport::Server, Request, Response, Status};
 use tracing::info;
 use uuid::Uuid;
 
 use proto::relay_service_server::{RelayService, RelayServiceServer};
 use proto::{
-    Ack, FetchSnapshotRequest, HeartbeatRequest, HeartbeatResponse, ListRefsRequest,
-    ListRefsResponse, OperationEnvelope, OpenSessionRequest, OpenSessionResponse, SnapshotChunk,
+    operation_envelope::Payload, Ack, BlobRef, FetchSnapshotRequest, HeartbeatRequest,
+    HeartbeatResponse, Label, LabelRef, ListRefsRequest, ListRefsResponse, OpenSessionRequest,
+    OpenSessionResponse, OperationEnvelope, SnapshotChunk, SnapshotMeta,
 };
 
 mod proto {
@@ -31,6 +32,8 @@ struct Args {
     storage_root: PathBuf,
     #[arg(long, default_value = "fs", value_parser = ["fs", "mem"])]
     backend: String,
+    #[arg(long)]
+    auth_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -39,6 +42,7 @@ struct SessionState {
     last_op: u64,
 }
 
+#[derive(Clone)]
 struct LitRelay {
     storage: Arc<dyn StorageBackend>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
@@ -51,10 +55,59 @@ impl LitRelay {
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    async fn persist_payload(
+        &self,
+        session_id: &str,
+        seq: u64,
+        payload: &Payload,
+    ) -> Result<(), Status> {
+        match payload {
+            Payload::Operation(op) => {
+                let mut buf = Vec::new();
+                op.encode(&mut buf)
+                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
+                let key = format!("logs/{session_id}/{seq:020}.bin");
+                self.storage
+                    .put_object(&key, &buf)
+                    .await
+                    .map_err(|e| Status::internal(format!("store failure: {e}")))?
+            }
+            Payload::Snapshot(snapshot) => {
+                let mut buf = Vec::new();
+                snapshot
+                    .encode(&mut buf)
+                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
+                let key = format!("snaps/meta/{}.bin", snapshot.snapshot_id);
+                self.storage
+                    .put_object(&key, &buf)
+                    .await
+                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
+                let data_key = format!("snaps/data/{}.bin", snapshot.snapshot_id);
+                if let Err(StorageError::NotFound(_)) = self.storage.get_object(&data_key).await {
+                    self.storage
+                        .put_object(&data_key, &[])
+                        .await
+                        .map_err(|e| Status::internal(format!("store failure: {e}")))?;
+                }
+            }
+            Payload::Label(label) => {
+                let mut buf = Vec::new();
+                label
+                    .encode(&mut buf)
+                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
+                let key = format!("labels/{}.bin", label.label_id);
+                self.storage
+                    .put_object(&key, &buf)
+                    .await
+                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
+            }
+        }
+        Ok(())
+    }
 }
 
-type ResponseStream =
-    std::pin::Pin<Box<dyn Stream<Item = Result<Ack, Status>> + Send + 'static>>;
+type ResponseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Ack, Status>> + Send + 'static>>;
 type ResponseStreamSnapshots =
     std::pin::Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send + 'static>>;
 
@@ -91,8 +144,8 @@ impl RelayService for LitRelay {
         request: Request<tonic::Streaming<OperationEnvelope>>,
     ) -> Result<Response<Self::StreamOpsStream>, Status> {
         let mut stream = request.into_inner();
-        let storage = self.storage.clone();
-        let sessions = self.sessions.clone();
+        let relay = self.clone();
+        let sessions = relay.sessions.clone();
         let output = try_stream! {
             while let Some(item) = stream.next().await {
                 let envelope = item?;
@@ -109,15 +162,11 @@ impl RelayService for LitRelay {
                     state.last_op += 1;
                     state.last_op
                 };
-                let key = format!("logs/{session_id}/{seq:020}.bin");
-                let mut buf = Vec::new();
-                envelope
-                    .encode(&mut buf)
-                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
-                storage
-                    .put_object(&key, &buf)
-                    .await
-                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
+                let payload = envelope
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("payload missing"))?;
+                relay.persist_payload(&session_id, seq, payload).await?;
                 yield Ack {
                     session_id: session_id.clone(),
                     last_applied_op: seq,
@@ -137,16 +186,23 @@ impl RelayService for LitRelay {
         if snapshot_id.is_empty() {
             return Err(Status::invalid_argument("snapshot_id is required"));
         }
-        let key = format!("snaps/{snapshot_id}.bin");
+        let key = format!("snaps/data/{snapshot_id}.bin");
         match self.storage.get_object(&key).await {
             Ok(bytes) => {
-                let chunk = SnapshotChunk {
-                    snapshot_id,
-                    data: bytes,
-                    index: 0,
-                    total: 1,
-                };
-                let stream = tokio_stream::iter(vec![Ok(chunk)]);
+                let chunk_size = 1024 * 1024;
+                let total = std::cmp::max(1, (bytes.len() + chunk_size - 1) / chunk_size);
+                let snapshot_id_clone = snapshot_id.clone();
+                let chunks = bytes
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(move |(index, data)| SnapshotChunk {
+                        snapshot_id: snapshot_id_clone.clone(),
+                        data: data.to_vec(),
+                        index: index as u32,
+                        total: total as u32,
+                    })
+                    .collect::<Vec<_>>();
+                let stream = tokio_stream::iter(chunks.into_iter().map(Ok));
                 Ok(Response::new(Box::pin(stream) as ResponseStreamSnapshots))
             }
             Err(StorageError::NotFound(_)) => Err(Status::not_found("snapshot not found")),
@@ -158,10 +214,63 @@ impl RelayService for LitRelay {
         &self,
         _request: Request<ListRefsRequest>,
     ) -> Result<Response<ListRefsResponse>, Status> {
+        let mut label_refs = Vec::new();
+        for key in self
+            .storage
+            .list_objects("labels")
+            .await
+            .map_err(|e| Status::internal(format!("{e}")))?
+        {
+            let bytes = self
+                .storage
+                .get_object(&key)
+                .await
+                .map_err(|e| Status::internal(format!("{e}")))?;
+            let label = Label::decode(&*bytes)
+                .map_err(|e| Status::internal(format!("decode failure: {e}")))?;
+            label_refs.push(LabelRef {
+                label_id: label.label_id,
+                name: label.name,
+                to_op: label.to_op,
+            });
+        }
+
+        let mut snapshot_ids = Vec::new();
+        for key in self
+            .storage
+            .list_objects("snaps/meta")
+            .await
+            .map_err(|e| Status::internal(format!("{e}")))?
+        {
+            let bytes = self
+                .storage
+                .get_object(&key)
+                .await
+                .map_err(|e| Status::internal(format!("{e}")))?;
+            let meta = SnapshotMeta::decode(&*bytes)
+                .map_err(|e| Status::internal(format!("decode failure: {e}")))?;
+            snapshot_ids.push(meta.snapshot_id);
+        }
+
+        let mut blob_refs = Vec::new();
+        for key in self
+            .storage
+            .list_objects("blobs")
+            .await
+            .map_err(|e| Status::internal(format!("{e}")))?
+        {
+            let parts: Vec<&str> = key.split('/').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let version_id = parts.last().unwrap().to_string();
+            let path = parts[1..parts.len() - 1].join("/");
+            blob_refs.push(BlobRef { path, version_id });
+        }
         let response = ListRefsResponse {
-            labels: vec![],
-            snapshots: vec![],
-            blobs: vec![],
+            labels: label_refs,
+            snapshots: snapshot_ids,
+            blobs: blob_refs,
         };
         Ok(Response::new(response))
     }
@@ -197,17 +306,41 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(FsBackend::new(config))
         }
     };
-    let relay = LitRelay::new(backend);
     let addr: SocketAddr = args
         .listen
         .parse()
         .context("failed to parse listen address")?;
     info!(%addr, "starting lit-relay server");
+    let interceptor = AuthInterceptor {
+        token: args.auth_token.clone(),
+    };
+    let service = RelayServiceServer::with_interceptor(LitRelay::new(backend), interceptor);
     Server::builder()
-        .add_service(RelayServiceServer::new(relay))
+        .add_service(service)
         .serve(addr)
         .await
-        .context("server failure")?
-        ;
+        .context("server failure")?;
     Ok(())
+}
+
+fn verify_bearer<T>(req: &Request<T>, token: &str) -> Result<(), Status> {
+    let expected = format!("Bearer {token}");
+    match req.metadata().get("authorization") {
+        Some(value) if value.to_str().map(|v| v == expected).unwrap_or(false) => Ok(()),
+        _ => Err(Status::unauthenticated("invalid or missing token")),
+    }
+}
+
+#[derive(Clone)]
+struct AuthInterceptor {
+    token: Option<String>,
+}
+
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(token) = &self.token {
+            verify_bearer(&req, token)?;
+        }
+        Ok(req)
+    }
 }
