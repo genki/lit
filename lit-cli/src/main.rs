@@ -301,11 +301,16 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     let lower = workspace_root.join("lower");
     let upper = workspace_root.join("upper");
     let work = workspace_root.join("work");
+    let workspace_exists = workspace_root.exists();
     fs::create_dir_all(&lower).await?;
     fs::create_dir_all(&upper).await?;
     fs::create_dir_all(&work).await?;
 
-    move_existing_contents(&canonical_target, &lower)?;
+    if workspace_exists {
+        sync_lower_to_target(&lower, &canonical_target)?;
+    } else {
+        move_existing_contents(&canonical_target, &lower)?;
+    }
     write_workspace_marker(&lower, &workspace_id)?;
     write_workspace_config(
         &workspace_root,
@@ -336,6 +341,13 @@ async fn run_off(args: OffArgs) -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
     let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    let workspace_id = workspace_id(&canonical).await?;
+    let workspace_root = lit_home_dir()?.join("workspaces").join(&workspace_id);
+    if !workspace_root.exists() {
+        return Err(anyhow!("{} is not a lit workspace", canonical.display()));
+    }
+    let lower = workspace_root.join("lower");
+    sync_mountpoint_to_lower(&canonical, &lower)?;
     let status = Command::new("fusermount3")
         .arg("-u")
         .arg(&canonical)
@@ -348,6 +360,7 @@ async fn run_off(args: OffArgs) -> anyhow::Result<()> {
             canonical.display()
         ));
     }
+    sync_lower_to_target(&lower, &canonical)?;
     println!("lit: unmounted {}", canonical.display());
     Ok(())
 }
@@ -395,6 +408,10 @@ fn lit_home_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn move_existing_contents(source: &Path, lower: &Path) -> anyhow::Result<()> {
+    if lower.exists() {
+        std::fs::remove_dir_all(lower)?;
+    }
+    std::fs::create_dir_all(lower)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -444,6 +461,45 @@ fn copy_recursive(source: &Path, dest: &Path) -> anyhow::Result<()> {
         std::fs::copy(source, dest)?;
     }
     Ok(())
+}
+
+fn copy_dir_contents(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let child_dest = dest.join(entry.file_name());
+        copy_recursive(&entry.path(), &child_dest)?;
+    }
+    Ok(())
+}
+
+fn clear_directory_contents(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                std::fs::remove_dir_all(&entry_path)?;
+            } else {
+                std::fs::remove_file(&entry_path)?;
+            }
+        }
+    } else {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
+fn sync_lower_to_target(lower: &Path, target: &Path) -> anyhow::Result<()> {
+    clear_directory_contents(target)?;
+    copy_dir_contents(lower, target)
+}
+
+fn sync_mountpoint_to_lower(mountpoint: &Path, lower: &Path) -> anyhow::Result<()> {
+    if lower.exists() {
+        std::fs::remove_dir_all(lower)?;
+    }
+    copy_dir_contents(mountpoint, lower)
 }
 
 fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
