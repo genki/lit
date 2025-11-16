@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use hex::ToHex;
 use libc;
+use lit_crdt::TextCrdt;
 use mime_guess::MimeGuess;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
@@ -709,11 +710,43 @@ fn normalize_relative(path: &Path) -> String {
     s
 }
 
+fn update_crdt_document(ctx: &WorkspaceContext, rel: &str) -> anyhow::Result<()> {
+    let doc_path = crdt_doc_path(&ctx.root, rel);
+    if let Some(parent) = doc_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = std::fs::read(&doc_path).unwrap_or_default();
+    let mut doc = TextCrdt::load(&bytes)?;
+    let target = ctx.mountpoint.join(rel);
+    if target.is_dir() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&target).unwrap_or_default();
+    doc.apply_text(&contents)?;
+    std::fs::write(doc_path, doc.save())?;
+    Ok(())
+}
+
+fn crdt_doc_path(root: &Path, rel: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(rel.as_bytes());
+    let name = format!("{}.amrg", hex::encode(hasher.finalize()));
+    root.join("crdt").join(name)
+}
+
 async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let watch = load_watchlist(&ctx.root)?;
     let targets: Vec<String> = if let Some(path) = args.path {
-        vec![relative_to_workspace(&path, &ctx.mountpoint).await?]
+        let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
+        if !watch.contains(&rel) {
+            println!(
+                "lit log: {} is not tracked; use `lit add {}` first",
+                rel, rel
+            );
+            return Ok(());
+        }
+        vec![rel]
     } else {
         watch.into_iter().collect()
     };
@@ -723,6 +756,7 @@ async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     }
     let mut output = String::new();
     for rel in targets {
+        update_crdt_document(&ctx, &rel)?;
         let mount_path = ctx.mountpoint.join(&rel);
         let lower_path = ctx.root.join("lower").join(&rel);
         let diff = generate_diff(&lower_path, &mount_path)?;
