@@ -32,10 +32,15 @@ mod proto {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "lit", about = "lit CLI prototype")]
+#[command(
+    name = "lit",
+    about = "lit CLI",
+    subcommand_required = false,
+    arg_required_else_help = false
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -102,11 +107,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Sync(args) => run_sync(args).await?,
-        Commands::BlobFetch(args) => run_blob_fetch(args).await?,
-        Commands::On(args) => run_on(args).await?,
-        Commands::Off(args) => run_off(args).await?,
-        Commands::Version => run_version(),
+        Some(Commands::Sync(args)) => run_sync(args).await?,
+        Some(Commands::BlobFetch(args)) => run_blob_fetch(args).await?,
+        Some(Commands::On(args)) => run_on(args).await?,
+        Some(Commands::Off(args)) => run_off(args).await?,
+        Some(Commands::Version) => run_version(),
+        None => run_status().await?,
     }
     Ok(())
 }
@@ -255,6 +261,28 @@ fn run_version() {
     println!("lit {}", env!("CARGO_PKG_VERSION"));
 }
 
+async fn run_status() -> anyhow::Result<()> {
+    let target = std::env::current_dir()?;
+    let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    let workspace_id = workspace_id(&canonical).await?;
+    let workspace_root = lit_home_dir()?.join("workspaces").join(&workspace_id);
+    if !workspace_root.exists() {
+        println!("lit: not initialized at {}", canonical.display());
+        return Ok(());
+    }
+    let state = if is_path_mounted(&canonical)? {
+        "ON"
+    } else {
+        "OFF"
+    };
+    println!("lit status: {}", state);
+    println!(" workspace: {}", workspace_id);
+    println!(" mountpoint: {}", canonical.display());
+    println!(" lower: {}", workspace_root.join("lower").display());
+    println!(" upper: {}", workspace_root.join("upper").display());
+    Ok(())
+}
+
 async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     let target = match args.path {
         Some(p) => p,
@@ -289,8 +317,7 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     )?;
 
     mount_overlay(&canonical_target, &lower, &upper, &work)?;
-    // Give the daemon a moment to mount before exiting
-    sleep(Duration::from_millis(500)).await;
+    wait_for_mount(&canonical_target).await?;
     println!(
         "lit: mounted workspace {} at {}",
         workspace_id,
@@ -336,6 +363,19 @@ fn ensure_fuse_overlayfs() -> anyhow::Result<()> {
     which::which("fuse-overlayfs")
         .map(|_| ())
         .map_err(|_| anyhow!("fuse-overlayfs not found; install fuse-overlayfs package"))
+}
+
+async fn wait_for_mount(path: &Path) -> anyhow::Result<()> {
+    for _ in 0..20 {
+        if is_path_mounted(path)? {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "timed out waiting for fuse-overlayfs to mount {}",
+        path.display()
+    ))
 }
 
 async fn workspace_id(path: &Path) -> anyhow::Result<String> {
@@ -452,4 +492,15 @@ fn mount_overlay(mountpoint: &Path, lower: &Path, upper: &Path, work: &Path) -> 
         .map_err(|e| anyhow!("failed to spawn fuse-overlayfs: {e}"))?;
     drop(status); // daemonizes on its own
     Ok(())
+}
+
+fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
+    match Command::new("mountpoint").arg("-q").arg(path).status() {
+        Ok(status) => Ok(status.success()),
+        Err(_) => {
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+            let display = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            Ok(mounts.contains(display.to_string_lossy().as_ref()))
+        }
+    }
 }
