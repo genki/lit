@@ -44,8 +44,10 @@ enum Commands {
     Sync(SyncArgs),
     /// Fetch a blob version
     BlobFetch(BlobFetchArgs),
-    /// Initialize and mount a workspace via FUSE overlay
-    Init(InitArgs),
+    /// Turn on lit (mount a workspace via FUSE overlay)
+    On(OnArgs),
+    /// Turn off lit (unmount a workspace)
+    Off(OffArgs),
     /// Show CLI version information
     Version,
 }
@@ -81,8 +83,14 @@ struct BlobFetchArgs {
 }
 
 #[derive(clap::Args, Debug)]
-struct InitArgs {
+struct OnArgs {
     /// Target directory to initialize (defaults to current directory)
+    path: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct OffArgs {
+    /// Targetディレクトリ(省略時はカレント)
     path: Option<PathBuf>,
 }
 
@@ -96,7 +104,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Sync(args) => run_sync(args).await?,
         Commands::BlobFetch(args) => run_blob_fetch(args).await?,
-        Commands::Init(args) => run_init(args).await?,
+        Commands::On(args) => run_on(args).await?,
+        Commands::Off(args) => run_off(args).await?,
         Commands::Version => run_version(),
     }
     Ok(())
@@ -246,7 +255,7 @@ fn run_version() {
     println!("lit {}", env!("CARGO_PKG_VERSION"));
 }
 
-async fn run_init(args: InitArgs) -> anyhow::Result<()> {
+async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     let target = match args.path {
         Some(p) => p,
         None => std::env::current_dir()?,
@@ -288,9 +297,31 @@ async fn run_init(args: InitArgs) -> anyhow::Result<()> {
         canonical_target.to_string_lossy()
     );
     println!(
-        "Unmount with: fusermount3 -u {}",
+        "Turn off with: lit off {}",
         canonical_target.to_string_lossy()
     );
+    Ok(())
+}
+
+async fn run_off(args: OffArgs) -> anyhow::Result<()> {
+    let target = match args.path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    let status = Command::new("fusermount3")
+        .arg("-u")
+        .arg(&canonical)
+        .status()
+        .map_err(|e| anyhow!("failed to run fusermount3: {e}"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "fusermount3 exited with status {} for {}",
+            status,
+            canonical.display()
+        ));
+    }
+    println!("lit: unmounted {}", canonical.display());
     Ok(())
 }
 
