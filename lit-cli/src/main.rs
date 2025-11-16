@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use hex::ToHex;
+use libc;
 use mime_guess::MimeGuess;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -324,14 +325,45 @@ fn move_existing_contents(source: &Path, lower: &Path) -> anyhow::Result<()> {
         }
         let dest = lower.join(&name);
         std::fs::create_dir_all(dest.parent().unwrap_or(lower))?;
-        std::fs::rename(entry.path(), &dest).map_err(|err| {
-            anyhow!(
-                "failed to move {} to {}: {}",
-                entry.path().display(),
-                dest.display(),
-                err
-            )
-        })?;
+        move_entry(&entry.path(), &dest)?;
+    }
+    Ok(())
+}
+
+fn move_entry(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    match std::fs::rename(source, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
+            copy_recursive(source, dest)?;
+            if source.is_dir() {
+                std::fs::remove_dir_all(source)?;
+            } else {
+                std::fs::remove_file(source)?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(anyhow!(
+            "failed to move {} to {}: {}",
+            source.display(),
+            dest.display(),
+            err
+        )),
+    }
+}
+
+fn copy_recursive(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let child_dest = dest.join(entry.file_name());
+            copy_recursive(&entry.path(), &child_dest)?;
+        }
+    } else {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, dest)?;
     }
     Ok(())
 }

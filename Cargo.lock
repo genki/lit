@@ -1214,6 +1214,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "libc",
  "mime_guess",
  "prost",
  "prost-build",
