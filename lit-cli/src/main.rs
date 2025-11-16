@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
+use std::env;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -62,6 +63,8 @@ enum Commands {
     /// Remove files/directories from watch list
     #[command(alias = "rm")]
     Untrack(TrackArgs),
+    /// Show diff between lower snapshot and current workspace
+    Log(LogArgs),
     /// Show CLI version information
     Version,
 }
@@ -115,6 +118,12 @@ struct TrackArgs {
     paths: Vec<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+struct LogArgs {
+    /// Optional file/directory to inspect
+    path: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -129,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Off(args)) => run_off(args).await?,
         Some(Commands::Track(args)) => run_track(args, true).await?,
         Some(Commands::Untrack(args)) => run_track(args, false).await?,
+        Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
         None => run_status().await?,
     }
@@ -697,4 +707,105 @@ fn normalize_relative(path: &Path) -> String {
         s = ".".to_string();
     }
     s
+}
+
+async fn run_log(args: LogArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    let watch = load_watchlist(&ctx.root)?;
+    let targets: Vec<String> = if let Some(path) = args.path {
+        vec![relative_to_workspace(&path, &ctx.mountpoint).await?]
+    } else {
+        watch.into_iter().collect()
+    };
+    if targets.is_empty() {
+        println!("lit log: no tracked paths");
+        return Ok(());
+    }
+    let mut output = String::new();
+    for rel in targets {
+        let mount_path = ctx.mountpoint.join(&rel);
+        let lower_path = ctx.root.join("lower").join(&rel);
+        let diff = generate_diff(&lower_path, &mount_path)?;
+        if diff.is_empty() {
+            output.push_str(&format!("diff -- lit {rel}: no changes\n\n"));
+        } else {
+            output.push_str(&format!("diff -- lit {rel}\n"));
+            output.push_str(&diff);
+            if !diff.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+    }
+    if output.is_empty() {
+        output.push_str("lit log: no changes\n");
+    }
+    display_with_pager(&output)?;
+    Ok(())
+}
+
+fn generate_diff(lower: &Path, mount: &Path) -> anyhow::Result<String> {
+    let recursive = lower.is_dir() || mount.is_dir();
+    let lower_arg = if lower.exists() {
+        lower.to_path_buf()
+    } else {
+        PathBuf::from("/dev/null")
+    };
+    let mount_arg = if mount.exists() {
+        mount.to_path_buf()
+    } else {
+        PathBuf::from("/dev/null")
+    };
+    let mut cmd = Command::new("diff");
+    if recursive {
+        cmd.arg("-urN");
+    } else {
+        cmd.arg("-u");
+    }
+    let output = cmd.arg(&lower_arg).arg(&mount_arg).output();
+    match output {
+        Ok(result) => match result.status.code() {
+            Some(0) => Ok(String::new()),
+            Some(1) | None => Ok(String::from_utf8_lossy(&result.stdout).to_string()),
+            _ => Err(anyhow!("diff command failed")),
+        },
+        Err(_) => {
+            if recursive {
+                Ok(String::new())
+            } else {
+                let old = std::fs::read_to_string(&lower_arg).unwrap_or_default();
+                let new = std::fs::read_to_string(&mount_arg).unwrap_or_default();
+                if old == new {
+                    Ok(String::new())
+                } else {
+                    Ok(format!(
+                        "--- {}\n+++ {}\n@@\n-{}\n+{}\n",
+                        lower_arg.display(),
+                        mount_arg.display(),
+                        old.trim_end(),
+                        new.trim_end()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn display_with_pager(text: &str) -> anyhow::Result<()> {
+    let pager = env::var("PAGER").unwrap_or_else(|_| String::from("less -R"));
+    let mut parts = pager.split_whitespace();
+    let cmd = parts.next().unwrap_or("less");
+    let args: Vec<&str> = parts.collect();
+    match Command::new(cmd).args(&args).stdin(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()?;
+        }
+        Err(_) => {
+            io::stdout().write_all(text.as_bytes())?;
+        }
+    }
+    Ok(())
 }
