@@ -31,6 +31,7 @@ source ~/.bashrc
 | `lit` | 現在のworkspaceステータス（ON/OFF、watch listなど）を表示 |
 | `lit add <path...>` | 追跡対象に追加（旧`lit track`） |
 | `lit rm <path...>` | 追跡対象から除外（旧`lit untrack`） |
+| `lit drop <path...>` | 指定ファイル/ディレクトリとその履歴を完全削除 |
 | `lit log [path]` | watch対象（または指定パス）の現在差分をpagerで表示 |
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |

@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write as IoWrite};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -66,6 +66,8 @@ enum Commands {
     /// Remove files/directories from watch list
     #[command(alias = "untrack")]
     Rm(WatchArgs),
+    /// Drop files and purge their history
+    Drop(DropArgs),
     /// Show diff between lower snapshot and current workspace
     Log(LogArgs),
     /// Show CLI version information
@@ -122,6 +124,13 @@ struct WatchArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct DropArgs {
+    /// Files/directories to delete from workspace & history
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
 struct LogArgs {
     /// Optional file/directory to inspect
     path: Option<PathBuf>,
@@ -141,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Off(args)) => run_off(args).await?,
         Some(Commands::Add(args)) => run_watch_args(args, true).await?,
         Some(Commands::Rm(args)) => run_watch_args(args, false).await?,
+        Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
         None => run_status().await?,
@@ -305,8 +315,8 @@ async fn run_status() -> anyhow::Result<()> {
             println!("lit status: {}", state);
             println!(" workspace: {}", ctx.workspace_id);
             println!(" mountpoint: {}", ctx.mountpoint.display());
-            println!(" lower: {}", ctx.root.join("lower").display());
-            println!(" upper: {}", ctx.root.join("upper").display());
+            println!(" lower: {}", ctx.lower.display());
+            println!(" upper: {}", ctx.upper.display());
             let watch = load_watchlist(&ctx.root)?;
             if watch.is_empty() {
                 println!(" tracked: (none)");
@@ -460,6 +470,7 @@ struct WorkspaceContext {
     workspace_id: String,
     root: PathBuf,
     lower: PathBuf,
+    upper: PathBuf,
 }
 
 async fn workspace_context_from_arg(path: Option<PathBuf>) -> anyhow::Result<WorkspaceContext> {
@@ -478,11 +489,13 @@ async fn workspace_context_from_mount(mountpoint: PathBuf) -> anyhow::Result<Wor
         Err(anyhow!("{} is not a lit workspace", mountpoint.display()))
     } else {
         let lower = root.join("lower");
+        let upper = root.join("upper");
         Ok(WorkspaceContext {
             mountpoint,
             workspace_id,
             root,
             lower,
+            upper,
         })
     }
 }
@@ -612,6 +625,41 @@ fn sync_upper_to_target(upper: &Path, target: &Path) -> anyhow::Result<()> {
     copy_dir_contents(upper, target)
 }
 
+fn fallback_relative_path(path: &Path, mount: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        if path.starts_with(mount) {
+            diff_paths(path, mount)
+        } else {
+            None
+        }
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+fn drop_target(ctx: &WorkspaceContext, rel: &str) -> anyhow::Result<()> {
+    remove_path(&ctx.mountpoint.join(rel))?;
+    remove_path(&ctx.lower.join(rel))?;
+    remove_path(&ctx.upper.join(rel))?;
+    let crdt_doc = crdt_doc_path(&ctx.root, rel);
+    if crdt_doc.exists() {
+        std::fs::remove_file(crdt_doc)?;
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
     let marker_dir = lower.join(".lit");
     std::fs::create_dir_all(&marker_dir)?;
@@ -719,6 +767,42 @@ async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_drop(args: DropArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    let mut watch = load_watchlist(&ctx.root)?;
+    let mut watch_changed = false;
+    for path in args.paths {
+        let rel = match relative_to_workspace(&path, &ctx.mountpoint).await {
+            Ok(rel) => rel,
+            Err(err) => {
+                let fallback =
+                    fallback_relative_path(&path, &ctx.mountpoint).map(|p| normalize_relative(&p));
+                if let Some(candidate) = fallback {
+                    if watch.contains(&candidate)
+                        || ctx.lower.join(&candidate).exists()
+                        || ctx.upper.join(&candidate).exists()
+                    {
+                        candidate
+                    } else {
+                        return Err(err);
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+        drop_target(&ctx, &rel)?;
+        if watch.remove(&rel) {
+            watch_changed = true;
+        }
+        println!("dropped {}", rel);
+    }
+    if watch_changed {
+        save_watchlist(&ctx.root, &watch)?;
+    }
+    Ok(())
+}
+
 async fn relative_to_workspace(path: &Path, mount: &Path) -> anyhow::Result<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -745,11 +829,29 @@ async fn relative_to_workspace(path: &Path, mount: &Path) -> anyhow::Result<Stri
 }
 
 fn normalize_relative(path: &Path) -> String {
-    let mut s = path.to_string_lossy().replace('\\', "/");
-    if s.is_empty() {
-        s = ".".to_string();
+    let mut segments: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if segments.is_empty() {
+                    segments.push("..".to_string());
+                } else {
+                    segments.pop();
+                }
+            }
+            Component::Normal(part) => segments.push(part.to_string_lossy().replace('\\', "/")),
+            Component::RootDir => {}
+            Component::Prefix(prefix) => {
+                segments.push(prefix.as_os_str().to_string_lossy().replace('\\', "/"))
+            }
+        }
     }
-    s
+    if segments.is_empty() {
+        ".".to_string()
+    } else {
+        segments.join("/")
+    }
 }
 
 fn update_crdt_document(ctx: &WorkspaceContext, rel: &str) -> anyhow::Result<()> {
