@@ -1216,9 +1216,11 @@ dependencies = [
  "hex",
  "libc",
  "mime_guess",
+ "pathdiff",
  "prost",
  "prost-build",
  "prost-types",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -1409,6 +1411,12 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "percent-encoding"

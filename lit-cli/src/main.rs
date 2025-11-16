@@ -4,8 +4,11 @@ use dirs::home_dir;
 use hex::ToHex;
 use libc;
 use mime_guess::MimeGuess;
+use pathdiff::diff_paths;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,12 @@ enum Commands {
     On(OnArgs),
     /// Turn off lit (unmount a workspace)
     Off(OffArgs),
+    /// Add files/directories to watch list
+    #[command(alias = "add")]
+    Track(TrackArgs),
+    /// Remove files/directories from watch list
+    #[command(alias = "rm")]
+    Untrack(TrackArgs),
     /// Show CLI version information
     Version,
 }
@@ -99,6 +108,13 @@ struct OffArgs {
     path: Option<PathBuf>,
 }
 
+#[derive(clap::Args, Debug)]
+struct TrackArgs {
+    /// Files/directories to add/remove from tracking
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -111,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::BlobFetch(args)) => run_blob_fetch(args).await?,
         Some(Commands::On(args)) => run_on(args).await?,
         Some(Commands::Off(args)) => run_off(args).await?,
+        Some(Commands::Track(args)) => run_track(args, true).await?,
+        Some(Commands::Untrack(args)) => run_track(args, false).await?,
         Some(Commands::Version) => run_version(),
         None => run_status().await?,
     }
@@ -264,22 +282,32 @@ fn run_version() {
 async fn run_status() -> anyhow::Result<()> {
     let target = std::env::current_dir()?;
     let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
-    let workspace_id = workspace_id(&canonical).await?;
-    let workspace_root = lit_home_dir()?.join("workspaces").join(&workspace_id);
-    if !workspace_root.exists() {
-        println!("lit: not initialized at {}", canonical.display());
-        return Ok(());
+    match workspace_context_from_mount(canonical.clone()).await {
+        Ok(ctx) => {
+            let state = if is_path_mounted(&ctx.mountpoint)? {
+                "ON"
+            } else {
+                "OFF"
+            };
+            println!("lit status: {}", state);
+            println!(" workspace: {}", ctx.workspace_id);
+            println!(" mountpoint: {}", ctx.mountpoint.display());
+            println!(" lower: {}", ctx.root.join("lower").display());
+            println!(" upper: {}", ctx.root.join("upper").display());
+            let watch = load_watchlist(&ctx.root)?;
+            if watch.is_empty() {
+                println!(" tracked: (none)");
+            } else {
+                println!(" tracked:");
+                for path in watch.into_iter().collect::<BTreeSet<_>>() {
+                    println!("  {}", path);
+                }
+            }
+        }
+        Err(_) => {
+            println!("lit: not initialized at {}", canonical.display());
+        }
     }
-    let state = if is_path_mounted(&canonical)? {
-        "ON"
-    } else {
-        "OFF"
-    };
-    println!("lit status: {}", state);
-    println!(" workspace: {}", workspace_id);
-    println!(" mountpoint: {}", canonical.display());
-    println!(" lower: {}", workspace_root.join("lower").display());
-    println!(" upper: {}", workspace_root.join("upper").display());
     Ok(())
 }
 
@@ -306,11 +334,10 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&upper).await?;
     fs::create_dir_all(&work).await?;
 
-    if workspace_exists {
-        sync_lower_to_target(&lower, &canonical_target)?;
-    } else {
-        move_existing_contents(&canonical_target, &lower)?;
+    if !workspace_exists {
+        save_watchlist(&workspace_root, &HashSet::new())?;
     }
+    move_existing_contents(&canonical_target, &lower)?;
     write_workspace_marker(&lower, &workspace_id)?;
     write_workspace_config(
         &workspace_root,
@@ -405,6 +432,35 @@ fn lit_home_dir() -> anyhow::Result<PathBuf> {
     let lit_home = home.join(".lit");
     std::fs::create_dir_all(&lit_home)?;
     Ok(lit_home)
+}
+
+struct WorkspaceContext {
+    mountpoint: PathBuf,
+    workspace_id: String,
+    root: PathBuf,
+}
+
+async fn workspace_context_from_arg(path: Option<PathBuf>) -> anyhow::Result<WorkspaceContext> {
+    let base = match path {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let canonical = fs::canonicalize(&base).await.unwrap_or(base.clone());
+    workspace_context_from_mount(canonical).await
+}
+
+async fn workspace_context_from_mount(mountpoint: PathBuf) -> anyhow::Result<WorkspaceContext> {
+    let workspace_id = workspace_id(&mountpoint).await?;
+    let root = lit_home_dir()?.join("workspaces").join(&workspace_id);
+    if !root.exists() {
+        Err(anyhow!("{} is not a lit workspace", mountpoint.display()))
+    } else {
+        Ok(WorkspaceContext {
+            mountpoint,
+            workspace_id,
+            root,
+        })
+    }
 }
 
 fn move_existing_contents(source: &Path, lower: &Path) -> anyhow::Result<()> {
@@ -559,4 +615,86 @@ fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
             Ok(mounts.contains(display.to_string_lossy().as_ref()))
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct WatchState {
+    paths: Vec<String>,
+}
+
+fn watchlist_path(root: &Path) -> PathBuf {
+    root.join("watch.json")
+}
+
+fn load_watchlist(root: &Path) -> anyhow::Result<HashSet<String>> {
+    let path = watchlist_path(root);
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let bytes = std::fs::read(&path)?;
+    let state: WatchState = serde_json::from_slice(&bytes)?;
+    Ok(state.paths.into_iter().collect())
+}
+
+fn save_watchlist(root: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let mut entries: Vec<_> = watch.iter().cloned().collect();
+    entries.sort();
+    let state = WatchState { paths: entries };
+    std::fs::write(watchlist_path(root), serde_json::to_vec_pretty(&state)?)?;
+    Ok(())
+}
+
+async fn run_track(args: TrackArgs, add: bool) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    let mut watch = load_watchlist(&ctx.root)?;
+    for path in args.paths {
+        let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
+        if add {
+            if watch.insert(rel.clone()) {
+                println!("added {rel}");
+            } else {
+                println!("already tracking {rel}");
+            }
+        } else if watch.remove(&rel) {
+            println!("removed {rel}");
+        } else {
+            println!("not tracked {rel}");
+        }
+    }
+    save_watchlist(&ctx.root, &watch)?;
+    Ok(())
+}
+
+async fn relative_to_workspace(path: &Path, mount: &Path) -> anyhow::Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        mount.join(path)
+    };
+    let canonical = fs::canonicalize(&absolute)
+        .await
+        .with_context(|| format!("failed to resolve {}", absolute.display()))?;
+    if !canonical.starts_with(mount) {
+        return Err(anyhow!(
+            "{} is outside the workspace {}",
+            canonical.display(),
+            mount.display()
+        ));
+    }
+    let rel = diff_paths(&canonical, mount).ok_or_else(|| {
+        anyhow!(
+            "failed to compute relative path for {}",
+            canonical.display()
+        )
+    })?;
+    Ok(normalize_relative(&rel))
+}
+
+fn normalize_relative(path: &Path) -> String {
+    let mut s = path.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        s = ".".to_string();
+    }
+    s
 }
