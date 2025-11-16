@@ -22,6 +22,25 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 
 - CLIは`$HOME/.lit`に設定・ソケット・キャッシュを保持し、`lit daemon`で明示起動/停止も可能にする。
 
+## リレー(gRPC)API仕様
+- `lit relay`はRust製gRPCサーバで、TLS(mTLS推奨)上にBearerトークン認証(JWT/PAT)を重ねる。CLIは`~/.lit/credentials`に保存したAPIトークンを使用する。
+- 主要RPC:
+  1. `OpenSession(OpenSessionRequest) -> OpenSessionResponse`
+     - クライアントがノードID/ホスト情報/サポートCRDTバージョン/最新ローカルバージョンベクタを送信。RelayはセッションIDとサーバ側ベクタを返し、同期すべき操作範囲を通知。
+  2. `StreamOps(stream OperationEnvelope) -> stream Ack`
+     - 双方向ストリーム。クライアントは操作ログ・スナップショットメタデータ・ラベルを送信し、Relayは処理結果とACK/エラーを逐次返す。未ACK分は再接続時に再送。
+  3. `FetchSnapshot(FetchSnapshotRequest) -> stream SnapshotChunk`
+     - 指定スナップショットIDまたは`since`パラメータからチャンク化して返却。
+  4. `ListRefs(ListRefsRequest) -> ListRefsResponse`
+     - ラベル、最新スナップショット、blobバージョンIDなどの参照情報を取得。
+  5. `Heartbeat(HeartbeatRequest) -> HeartbeatResponse`
+     - 長時間接続のヘルスチェック。Relayはタイムアウト時にセッションを閉じる。
+- 認証/認可:
+  - gRPCハンドシェイク時にTLSを必須化。組織内はmTLS、公開RelayはTLS+Bearerトークンを推奨。
+  - RelayはPostgreSQL等でAPIトークン/ノード登録情報を管理し、Push/Pull権限やアクセス可能な名前空間を制御。
+- 障害時再接続:
+  - クライアントは再接続時に`OpenSession`で前回セッションIDと最後にACKされた操作IDを提示。Relayは欠落操作のみ再送要求して冪等性を維持する。
+
 ## システム要件
 - **FUSE互換実装**: ユーザ空間で動作し、POSIXファイル操作(オープン/クローズ/リード/ライト/renameなど)やメタデータ操作(chmod/chown/utimens、ディレクトリ作成/削除、シンボリックリンク/ハードリンク、拡張属性)を余さずフックしてイベントを取得する。
 - **マウントターゲット**: 任意の既存ディレクトリに`lit mount <path>`のような形でマウントし、アンマウント時もデータを失わない。
@@ -84,6 +103,18 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 - チェックポイントはメタデータと内容を分離保存し、部分リストア(特定ディレクトリ/ファイルのみ)にも対応する。
 - ローカル`.lit`では「操作ログ(append-only segment)」「スナップショット」「blobオブジェクト」を別ディレクトリに分離し、S3互換ストレージ/MinIO等と同じフォーマットで保存。これによりオンライン/オフライン問わず同じデータ構造で同期可能。
 - RelayサーバはPostgreSQL/SQLite等でメタデータ(バージョンベクタ、ラベル、インデックス)を保持し、内容本体はオブジェクトストアへ書き込む。抽象化レイヤによりローカルFS → S3 への移行を容易にする。
+
+## ストレージ抽象とRustプロトタイピング
+- Rustで`StorageBackend`トレイトを定義し、`put_object`, `get_object`, `list`, `delete`, `compose_snapshot`などの操作を共通化。実装例:
+  - `FsBackend`: ローカル`.lit`配下に保存。POSIXロックで排他し、開発初期から利用。
+  - `S3Backend`: AWS S3/MinIO互換APIを使用。`rusoto`/`aws-sdk-rust`で実装し、サーバ/クライアント双方から同一コードを利用。
+  - `MemBackend`: テスト用のメモリ実装。CRDT単体テストやCI用に活用。
+- 操作ログは`log/<segment-id>.wal`にappend-onlyで書き、スナップショットは`snaps/<snapshot-id>/metadata.json`とチャンクファイルで保存。blobは`objects/<hash-prefix>/<hash>`で内容アドレス化。
+- 初期プロトタイプ手順:
+  1. Rust crate `lit-storage`を作り、`StorageBackend`トレイトと3実装(Fs/S3/Mem)を追加。
+  2. `lit relay`およびCLIがこのcrateを依存し、環境変数や設定でバックエンドを切り替えられるようにする。
+  3. `cargo test -p lit-storage`でバックエンドごとの契約テストを実行。S3BackendはMinIOコンテナをCIで起動して統合テストを行う。
+- これによりストレージ層を差し替えつつ仕様整合性を保ったまま実装を進められる。
 
 ## 非機能要件
 - **堅牢性**: 不意のクラッシュ後でもログから復旧できるよう、操作記録はジャーナリングする。
