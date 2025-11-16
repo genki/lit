@@ -32,6 +32,8 @@ source ~/.bashrc
 | `lit add <path...>` | 追跡対象に追加（旧`lit track`） |
 | `lit rm <path...>` | 追跡対象から除外（旧`lit untrack`） |
 | `lit drop <path...>` | 指定ファイル/ディレクトリとその履歴を完全削除 |
+| `lit tag <name> [message]` | 現在の状態をタグとしてスナップショット化 |
+| `lit reset <name>` | 指定タグの状態にワークスペースを巻き戻す |
 | `lit log [path]` | watch対象（または指定パス）の現在差分をpagerで表示 |
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |

@@ -66,6 +66,10 @@ enum Commands {
     /// Remove files/directories from watch list
     #[command(alias = "untrack")]
     Rm(WatchArgs),
+    /// Create a tag for current workspace state
+    Tag(TagArgs),
+    /// Reset workspace to a tagged state
+    Reset(ResetArgs),
     /// Drop files and purge their history
     Drop(DropArgs),
     /// Show diff between lower snapshot and current workspace
@@ -150,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Off(args)) => run_off(args).await?,
         Some(Commands::Add(args)) => run_watch_args(args, true).await?,
         Some(Commands::Rm(args)) => run_watch_args(args, false).await?,
+        Some(Commands::Tag(args)) => run_tag(args).await?,
+        Some(Commands::Reset(args)) => run_reset(args).await?,
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
@@ -722,6 +728,13 @@ struct WatchState {
     paths: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct TagMetadata {
+    name: String,
+    message: Option<String>,
+    created_at: i64,
+}
+
 fn watchlist_path(root: &Path) -> PathBuf {
     root.join("watch.json")
 }
@@ -745,6 +758,38 @@ fn save_watchlist(root: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tags_root(root: &Path) -> PathBuf {
+    root.join("tags")
+}
+
+fn tag_dir(root: &Path, name: &str) -> PathBuf {
+    tags_root(root).join(name)
+}
+
+fn tag_tree_path(root: &Path, name: &str) -> PathBuf {
+    tag_dir(root, name).join("tree")
+}
+
+fn write_tag_metadata(dir: &Path, meta: &TagMetadata) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let meta_path = dir.join("meta.json");
+    std::fs::write(meta_path, serde_json::to_vec_pretty(meta)?)?;
+    Ok(())
+}
+
+fn validate_tag_name(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("tag name cannot be empty"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(anyhow!("tag name cannot contain path separators"));
+    }
+    if name == "." || name == ".." {
+        return Err(anyhow!("tag name {} is invalid", name));
+    }
+    Ok(())
+}
+
 async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let mut watch = load_watchlist(&ctx.root)?;
@@ -764,6 +809,45 @@ async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
         }
     }
     save_watchlist(&ctx.root, &watch)?;
+    Ok(())
+}
+
+async fn run_tag(args: TagArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    validate_tag_name(&args.name)?;
+    let tag_dir = tag_dir(&ctx.root, &args.name);
+    if tag_dir.exists() {
+        return Err(anyhow!("tag {} already exists", args.name));
+    }
+    let tree_path = tag_tree_path(&ctx.root, &args.name);
+    clear_directory_contents(&tree_path)?;
+    copy_dir_contents(&ctx.mountpoint, &tree_path)?;
+    let metadata = TagMetadata {
+        name: args.name.clone(),
+        message: if args.message.is_empty() {
+            None
+        } else {
+            Some(args.message.join(" "))
+        },
+        created_at: unix_timestamp(),
+    };
+    write_tag_metadata(&tag_dir, &metadata)?;
+    println!("created tag {}", args.name);
+    Ok(())
+}
+
+async fn run_reset(args: ResetArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    validate_tag_name(&args.name)?;
+    let tree_path = tag_tree_path(&ctx.root, &args.name);
+    if !tree_path.exists() {
+        return Err(anyhow!("tag {} not found", args.name));
+    }
+    clear_directory_contents(&ctx.upper)?;
+    copy_dir_contents(&tree_path, &ctx.upper)?;
+    clear_directory_contents(&ctx.lower)?;
+    copy_dir_contents(&tree_path, &ctx.lower)?;
+    println!("reset to tag {}", args.name);
     Ok(())
 }
 
@@ -988,4 +1072,18 @@ fn display_with_pager(text: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+#[derive(clap::Args, Debug)]
+struct TagArgs {
+    /// Tag名
+    name: String,
+    /// 任意のメッセージ
+    #[arg(num_args = 0.., trailing_var_arg = true)]
+    message: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct ResetArgs {
+    /// 巻き戻すタグ名
+    name: String,
 }
