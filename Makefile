@@ -1,15 +1,18 @@
-.PHONY: install install-cli install-relay test relay cache-dir
+.PHONY: install install-cli install-relay install-fs test relay cache-dir
 
 CARGO_TARGET_DIR ?= $(HOME)/.cache/lit/target
 export CARGO_TARGET_DIR
 
-install: install-cli install-relay
+install: install-cli install-relay install-fs
 
 install-cli: cache-dir
 	cargo install --path lit-cli --force
 
 install-relay: cache-dir
 	cargo install --path lit-relay --force
+
+install-fs: cache-dir
+	cargo install --path lit-fs --force
 
 test: cache-dir
 	cargo fmt --all

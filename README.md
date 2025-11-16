@@ -4,7 +4,7 @@ litはFUSEベースでディレクトリ全体をマウントし、編集操作�
 
 ## 主な特徴
 
-- **FUSEオーバーレイマウント**: `lit on <path>`で指定ディレクトリを`fuse-overlayfs`経由でマウント。`lit off <path>`でアンマウントしつつ最新内容を元ディレクトリへ戻せます。
+- **自前のlibfuseデーモン**: `lit on <path>`は`lit-fs`(Rust + libfuse)を起動し、PID/UID付きでファイル操作を捕捉します。`lit off <path>`でアンマウントするとlowerディレクトリへ書き戻して通常ディレクトリとして再利用できます。
 - **watch list 管理**: `lit add`で追跡するファイル/ディレクトリを登録、`lit rm`で解除。watch list は`~/.lit/workspaces/<workspace-id>/watch.json`に保存されます。
 - **差分確認 / CRDT同期**: `lit log [path]`はwatch listに登録されたパスの現在差分を`diff -u`形式で生成するだけでなく、内部でAutomergeベースのCRDT(`lit-crdt` crate)へ内容を反映し、将来のマージに備えた変更ログも更新します。
 - **ステータス表示**: `lit`単体実行でworkspace ID、ON/OFF状態、lower/upper/mountpoint、watch list を確認できます。

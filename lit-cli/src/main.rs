@@ -359,7 +359,7 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
         &work,
     )?;
 
-    mount_overlay(&canonical_target, &lower, &upper, &work)?;
+    spawn_lit_fs_daemon(&lower, &canonical_target)?;
     wait_for_mount(&canonical_target).await?;
     println!(
         "lit: mounted workspace {} at {}",
@@ -600,23 +600,6 @@ fn write_workspace_config(
     Ok(())
 }
 
-fn mount_overlay(mountpoint: &Path, lower: &Path, upper: &Path, work: &Path) -> anyhow::Result<()> {
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lower.display(),
-        upper.display(),
-        work.display()
-    );
-    let status = Command::new("fuse-overlayfs")
-        .arg("-o")
-        .arg(opts)
-        .arg(mountpoint)
-        .spawn()
-        .map_err(|e| anyhow!("failed to spawn fuse-overlayfs: {e}"))?;
-    drop(status); // daemonizes on its own
-    Ok(())
-}
-
 fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
     match Command::new("mountpoint").arg("-q").arg(path).status() {
         Ok(status) => Ok(status.success()),
@@ -626,6 +609,21 @@ fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
             Ok(mounts.contains(display.to_string_lossy().as_ref()))
         }
     }
+}
+
+fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path) -> anyhow::Result<()> {
+    let bin = which::which("lit-fs").context("lit-fs binary not found")?;
+    std::fs::create_dir_all(source)?;
+    Command::new(bin)
+        .arg("--source")
+        .arg(source)
+        .arg("--mountpoint")
+        .arg(mountpoint)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow!("failed to spawn lit-fs: {e}"))
 }
 
 #[derive(Serialize, Deserialize, Default)]

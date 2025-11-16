@@ -1,0 +1,14 @@
+[package]
+name = "lit-fs"
+version = "0.1.0"
+edition = "2021"
+description = "libfuse-based filesystem for lit"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fuser = "0.13"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
