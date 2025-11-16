@@ -58,11 +58,11 @@ enum Commands {
     /// Turn off lit (unmount a workspace)
     Off(OffArgs),
     /// Add files/directories to watch list
-    #[command(alias = "add")]
-    Track(TrackArgs),
+    #[command(alias = "track")]
+    Add(WatchArgs),
     /// Remove files/directories from watch list
-    #[command(alias = "rm")]
-    Untrack(TrackArgs),
+    #[command(alias = "untrack")]
+    Rm(WatchArgs),
     /// Show diff between lower snapshot and current workspace
     Log(LogArgs),
     /// Show CLI version information
@@ -112,7 +112,7 @@ struct OffArgs {
 }
 
 #[derive(clap::Args, Debug)]
-struct TrackArgs {
+struct WatchArgs {
     /// Files/directories to add/remove from tracking
     #[arg(required = true)]
     paths: Vec<PathBuf>,
@@ -136,8 +136,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::BlobFetch(args)) => run_blob_fetch(args).await?,
         Some(Commands::On(args)) => run_on(args).await?,
         Some(Commands::Off(args)) => run_off(args).await?,
-        Some(Commands::Track(args)) => run_track(args, true).await?,
-        Some(Commands::Untrack(args)) => run_track(args, false).await?,
+        Some(Commands::Add(args)) => run_watch_args(args, true).await?,
+        Some(Commands::Rm(args)) => run_watch_args(args, false).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
         None => run_status().await?,
@@ -655,7 +655,7 @@ fn save_watchlist(root: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_track(args: TrackArgs, add: bool) -> anyhow::Result<()> {
+async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let mut watch = load_watchlist(&ctx.root)?;
     for path in args.paths {
