@@ -46,6 +46,8 @@ enum Commands {
     BlobFetch(BlobFetchArgs),
     /// Initialize and mount a workspace via FUSE overlay
     Init(InitArgs),
+    /// Show CLI version information
+    Version,
 }
 
 #[derive(clap::Args, Debug)]
@@ -95,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sync(args) => run_sync(args).await?,
         Commands::BlobFetch(args) => run_blob_fetch(args).await?,
         Commands::Init(args) => run_init(args).await?,
+        Commands::Version => run_version(),
     }
     Ok(())
 }
@@ -237,6 +240,10 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn run_version() {
+    println!("lit {}", env!("CARGO_PKG_VERSION"));
 }
 
 async fn run_init(args: InitArgs) -> anyhow::Result<()> {
