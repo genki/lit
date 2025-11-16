@@ -99,6 +99,16 @@ message ListRefsResponse {
   repeated BlobRef blobs = 3;
 }
 
+message FetchBlobRequest {
+  string session_id = 1;
+  string path = 2;
+  string version_id = 3;
+}
+
+message FetchBlobResponse {
+  bytes data = 1;
+}
+
 message HeartbeatRequest {
   string session_id = 1;
 }
@@ -114,4 +124,5 @@ service RelayService {
   rpc FetchSnapshot(FetchSnapshotRequest) returns (stream SnapshotChunk);
   rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc FetchBlob(FetchBlobRequest) returns (FetchBlobResponse);
 }

@@ -6,17 +6,21 @@ use clap::Parser;
 use futures::Stream;
 use futures::StreamExt;
 use lit_storage::{FsBackend, StorageBackend, StorageConfig, StorageError};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use prost::Message;
 use tokio::sync::RwLock;
 use tonic::{service::Interceptor, transport::Server, Request, Response, Status};
 use tracing::info;
 use uuid::Uuid;
 
+const PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.');
+
 use proto::relay_service_server::{RelayService, RelayServiceServer};
 use proto::{
-    operation_envelope::Payload, Ack, BlobRef, FetchSnapshotRequest, HeartbeatRequest,
-    HeartbeatResponse, Label, LabelRef, ListRefsRequest, ListRefsResponse, OpenSessionRequest,
-    OpenSessionResponse, OperationEnvelope, SnapshotChunk, SnapshotMeta,
+    operation_envelope::Payload, Ack, BlobRef, FetchBlobRequest, FetchBlobResponse,
+    FetchSnapshotRequest, HeartbeatRequest, HeartbeatResponse, Label, LabelRef, ListRefsRequest,
+    ListRefsResponse, OpenSessionRequest, OpenSessionResponse, OperationEnvelope, SnapshotChunk,
+    SnapshotMeta,
 };
 
 mod proto {
@@ -71,7 +75,12 @@ impl LitRelay {
                 self.storage
                     .put_object(&key, &buf)
                     .await
-                    .map_err(|e| Status::internal(format!("store failure: {e}")))?
+                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
+                if op.is_blob {
+                    let version_id = format!("{seq:020}");
+                    self.store_blob(&op.file_path, &version_id, &op.payload)
+                        .await?;
+                }
             }
             Payload::Snapshot(snapshot) => {
                 let mut buf = Vec::new();
@@ -104,6 +113,14 @@ impl LitRelay {
             }
         }
         Ok(())
+    }
+
+    async fn store_blob(&self, path: &str, version_id: &str, data: &[u8]) -> Result<(), Status> {
+        let key = format!("blobs/{}/{}", encode_blob_path(path), version_id);
+        self.storage
+            .put_object(&key, data)
+            .await
+            .map_err(|e| Status::internal(format!("store failure: {e}")))
     }
 }
 
@@ -210,6 +227,22 @@ impl RelayService for LitRelay {
         }
     }
 
+    async fn fetch_blob(
+        &self,
+        request: Request<FetchBlobRequest>,
+    ) -> Result<Response<FetchBlobResponse>, Status> {
+        let req = request.into_inner();
+        if req.path.is_empty() || req.version_id.is_empty() {
+            return Err(Status::invalid_argument("path and version_id are required"));
+        }
+        let key = format!("blobs/{}/{}", encode_blob_path(&req.path), req.version_id);
+        match self.storage.get_object(&key).await {
+            Ok(data) => Ok(Response::new(FetchBlobResponse { data })),
+            Err(StorageError::NotFound(_)) => Err(Status::not_found("blob not found")),
+            Err(err) => Err(Status::internal(format!("{err}"))),
+        }
+    }
+
     async fn list_refs(
         &self,
         _request: Request<ListRefsRequest>,
@@ -260,12 +293,14 @@ impl RelayService for LitRelay {
             .map_err(|e| Status::internal(format!("{e}")))?
         {
             let parts: Vec<&str> = key.split('/').collect();
-            if parts.len() < 3 {
+            if parts.len() != 3 {
                 continue;
             }
-            let version_id = parts.last().unwrap().to_string();
-            let path = parts[1..parts.len() - 1].join("/");
-            blob_refs.push(BlobRef { path, version_id });
+            let encoded_path = parts[1];
+            if let Some(path) = decode_blob_path(encoded_path) {
+                let version_id = parts[2].to_string();
+                blob_refs.push(BlobRef { path, version_id });
+            }
         }
         let response = ListRefsResponse {
             labels: label_refs,
@@ -343,4 +378,15 @@ impl Interceptor for AuthInterceptor {
         }
         Ok(req)
     }
+}
+
+fn encode_blob_path(path: &str) -> String {
+    utf8_percent_encode(path, PATH_ENCODE_SET).to_string()
+}
+
+fn decode_blob_path(encoded: &str) -> Option<String> {
+    percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()
+        .map(|cow| cow.into_owned())
 }
