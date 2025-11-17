@@ -73,6 +73,8 @@ enum Commands {
     Reset(ResetArgs),
     /// Acquire a lock on a path
     Lock(LockArgs),
+    /// Unlock a previously acquired lock
+    Unlock(UnlockArgs),
     /// Drop files and purge their history
     Drop(DropArgs),
     /// Show diff between lower snapshot and current workspace
@@ -160,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Tag(args)) => run_tag(args).await?,
         Some(Commands::Reset(args)) => run_reset(args).await?,
         Some(Commands::Lock(args)) => run_lock(args).await?,
+        Some(Commands::Unlock(args)) => run_unlock(args).await?,
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
@@ -903,6 +906,34 @@ fn format_timestamp(ts: i64) -> String {
     }
 }
 
+fn list_locks(root: &Path) -> anyhow::Result<()> {
+    let state = load_locks(root)?;
+    if state.locks.is_empty() {
+        println!("(no locks)");
+        return Ok(());
+    }
+    let mut entries = state.locks.clone();
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then(a.created_at.cmp(&b.created_at)));
+    for entry in entries {
+        let created = format_timestamp(entry.created_at);
+        let mut line = format!(
+            "{} {} uid={} pid={}",
+            created, entry.path, entry.owner_uid, entry.owner_pid
+        );
+        if let Some(msg) = entry.message.as_deref() {
+            if !msg.is_empty() {
+                line.push(' ');
+                line.push_str(msg);
+            }
+        }
+        if let Some(exp) = entry.expires_at {
+            line.push_str(&format!(" (expires {})", format_timestamp(exp)));
+        }
+        println!("{}", line);
+    }
+    Ok(())
+}
+
 async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let mut watch = load_watchlist(&ctx.root)?;
@@ -970,50 +1001,70 @@ async fn run_reset(args: ResetArgs) -> anyhow::Result<()> {
 
 async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
+    if let Some(path) = args.path {
+        let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
+        let mut state = load_locks(&ctx.root)?;
+        let now = unix_timestamp();
+        let expired_removed = prune_expired_locks(&mut state, now);
+        if let Some(existing) = state
+            .locks
+            .iter()
+            .find(|entry| entry.path == rel && !entry.is_expired(now))
+        {
+            if existing.owner_uid != current_uid() {
+                let msg = existing
+                    .message
+                    .as_deref()
+                    .unwrap_or("locked by another process");
+                return Err(anyhow!(
+                    "{} is locked by uid {} pid {}: {}",
+                    rel,
+                    existing.owner_uid,
+                    existing.owner_pid,
+                    msg
+                ));
+            }
+        }
+        let expires_at = args.timeout.filter(|t| *t > 0).map(|t| now + t as i64);
+        let entry = LockEntry {
+            path: rel.clone(),
+            owner_uid: current_uid(),
+            owner_pid: current_pid(),
+            message: args.message.clone(),
+            created_at: now,
+            expires_at,
+        };
+        state.locks.retain(|e| e.path != rel);
+        state.locks.push(entry);
+        save_locks(&ctx.root, &state)?;
+        if expired_removed {
+            println!("expired locks were cleaned up");
+        }
+        println!(
+            "locked {} (uid={} pid={})",
+            rel,
+            current_uid(),
+            current_pid()
+        );
+    } else {
+        list_locks(&ctx.root)?;
+    }
+    Ok(())
+}
+
+async fn run_unlock(args: UnlockArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
     let rel = relative_to_workspace(&args.path, &ctx.mountpoint).await?;
     let mut state = load_locks(&ctx.root)?;
-    let now = unix_timestamp();
-    let expired_removed = prune_expired_locks(&mut state, now);
-    if let Some(existing) = state
+    let before = state.locks.len();
+    state
         .locks
-        .iter()
-        .find(|entry| entry.path == rel && !entry.is_expired(now))
-    {
-        if existing.owner_uid != current_uid() || existing.owner_pid != current_pid() {
-            let msg = existing
-                .message
-                .as_deref()
-                .unwrap_or("locked by another process");
-            return Err(anyhow!(
-                "{} is locked by uid {} pid {}: {}",
-                rel,
-                existing.owner_uid,
-                existing.owner_pid,
-                msg
-            ));
-        }
+        .retain(|entry| !(entry.path == rel && entry.owner_uid == current_uid()));
+    if state.locks.len() == before {
+        return Err(anyhow!("no lock held by uid={} on {}", current_uid(), rel));
     }
-    let expires_at = args.timeout.filter(|t| *t > 0).map(|t| now + t as i64);
-    let entry = LockEntry {
-        path: rel.clone(),
-        owner_uid: current_uid(),
-        owner_pid: current_pid(),
-        message: args.message.clone(),
-        created_at: now,
-        expires_at,
-    };
-    state.locks.retain(|e| e.path != rel);
-    state.locks.push(entry);
     save_locks(&ctx.root, &state)?;
-    if expired_removed {
-        println!("expired locks were cleaned up");
-    }
-    println!(
-        "locked {} (uid={} pid={})",
-        rel,
-        current_uid(),
-        current_pid()
-    );
+    println!("unlocked {}", rel);
     Ok(())
 }
 
@@ -1256,12 +1307,18 @@ struct ResetArgs {
 
 #[derive(clap::Args, Debug)]
 struct LockArgs {
-    /// ロック対象のファイル/ディレクトリ
-    path: PathBuf,
+    /// ロック対象（省略時は一覧表示）
+    path: Option<PathBuf>,
     /// ロックの有効期限（秒）
     #[arg(long)]
     timeout: Option<u64>,
     /// ロック理由のメッセージ
     #[arg(short = 'm', long = "message")]
     message: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct UnlockArgs {
+    /// 解除対象パス
+    path: PathBuf,
 }
