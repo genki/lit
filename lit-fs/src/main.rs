@@ -82,6 +82,8 @@ struct LockEntryFs {
     owner_pid: u32,
     message: Option<String>,
     expires_at: Option<i64>,
+    #[serde(default)]
+    owner_session: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

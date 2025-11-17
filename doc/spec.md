@@ -28,11 +28,11 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 ### ワークスペース管理
 - `lit on`は対象ディレクトリの内容を`lower`に退避し、作業コピーを`upper`に複製した上で`lit-fs`(libfuseベースのRustデーモン)を`mountpoint`へアタッチする。`lit-fs`はPID/UIDを取得できるため、操作ログやロック強制に利用できる。
 - `lit off`は`fusermount3 -u`でアンマウントし、`upper`の内容をターゲットへ戻す。`lower`はベースラインとして保持され、次回`lit log`で差分を計算する際の参照になる。
-- `watch.json`には`lit add/rm`で管理対象とするパスを記録する。`lit log`はwatch listに含まれるファイルのみを対象に`diff`を生成し、Automergeベースの`lit-crdt`ドキュメントに反映する。
+- watch listは共有(`watch.json`)とセッション別(`watch/<session>.json`)に分かれており、`lit add/rm`はデフォルトでセッション側を更新する。セッションIDは環境変数`LIT_SESSION_ID`で外部から指定でき、未設定時はCLIが自動生成する。`lit log`は両者の和集合のみを対象に`diff`を生成し、Automergeベースの`lit-crdt`ドキュメントに反映する。
 
 ### タグとロック
 - タグは`~/.lit/workspaces/<id>/tags/<name>/tree`にワークスペース全体を複製し、`meta.json`に作成時刻とメッセージを保存する。`lit tag`を引数なしで呼ぶと作成済みタグを時系列で出力し、`lit reset <name>`で任意タグへ復元できる。
-- ロック情報は`locks.json`に配列で保存され、各エントリに`path`, `owner_uid`, `owner_pid`, `message`, `expires_at`を持つ。`lit lock <path>`は同一UIDであれば既存PIDの死活をチェックして再取得でき、`lit unlock <path>`は元PIDが生存していない場合に別PIDからも解除できる。`lit-fs`は書き込み系操作(write/mkdir/create/unlink)の前に`locks.json`を読み込み、UID/PIDが一致しない操作をEACCESで拒否しつつメッセージをstderrへ出力する。
+- ロック情報は`locks.json`に配列で保存され、各エントリに`path`, `owner_uid`, `owner_pid`, `owner_session`, `message`, `expires_at`を持つ。`lit lock <path>`は同一UIDかつ同一セッション(`LIT_SESSION_ID`)ならPIDの死活を確認して再取得でき、`lit unlock <path>`は元PIDが存在しない場合に同UIDの別PIDから解除できる。`lit-fs`は書き込み系操作(write/mkdir/create/unlink)の前に`locks.json`を読み込み、UID/PIDが一致しない操作をEACCESで拒否しつつメッセージをstderrへ出力する。
 
 ## リレー(gRPC)API仕様
 - `lit relay`はRust製gRPCサーバで、TLS(mTLS推奨)上にBearerトークン認証(JWT/PAT)を重ねる。CLIは`~/.lit/credentials`に保存したAPIトークンを使用する。

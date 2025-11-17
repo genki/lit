@@ -29,18 +29,20 @@ source ~/.bashrc
 | `lit on [path]` | ディレクトリを初期化＆マウント（省略時はCWD） |
 | `lit off [path]` | マウント解除し、lower→ターゲットへ最新状態を復元 |
 | `lit` | 現在のworkspaceステータス（ON/OFF、watch listなど）を表示 |
-| `lit add <path...>` | 追跡対象に追加（旧`lit track`） |
-| `lit rm <path...>` | 追跡対象から除外（旧`lit untrack`） |
+| `lit add <path...>` | セッション固有watch listに追加（`--global`で共有） |
+| `lit rm <path...>` | セッション固有watch listから除外（`--global`で共有分も削除） |
 | `lit drop <path...>` | 指定ファイル/ディレクトリとその履歴を完全削除 |
 | `lit tag <name> [message]` | 現在の状態をタグとしてスナップショット化 |
 | `lit reset <name>` | 指定タグの状態にワークスペースを巻き戻す |
 | `lit tag` | 作成済みタグを時刻/タグ名/メッセージで一覧表示 |
-| `lit lock [path] [--timeout SEC] [-m MSG]` | パスをロック（省略時はロック一覧）し、他UID/PIDからの変更を拒否 |
+| `lit lock [path] [--timeout SEC] [-m MSG]` | パスをロック（省略時はロック一覧）し、他UID/PID/セッションからの変更を拒否 |
 | `lit unlock <path>` | 自分が保有するロックを解除 |
 | `lit log [path]` | watch対象（または指定パス）の現在差分をpagerで表示 |
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |
 | `lit version` | CLIのバージョン情報を表示 |
+
+`lit log --watch --interval 5`で差分を定期監視したり、`lit sync --remote <url> --repeat 30`でリレー同期を自動実行したりといった常駐モードも利用できます。
 
 ## 基本的なワークフロー
 
@@ -53,9 +55,9 @@ source ~/.bashrc
 ## 注意事項
 
 - `lit on`/`lit off`は内部で自前の`lit-fs`デーモン(libfuseベース)と`fusermount3`を利用します。`libfuse3`がインストールされていることを確認してください。
-- watch listに登録していないパスは追跡されません。`lit add`で管理したいパスを明示的に追加してください。
+- watch listに登録していないパスは追跡されません。`lit add`で管理したいパスを明示的に追加してください（デフォルトではセッション固有リストに追加されます）。
 - `lit log`は`diff`コマンドを利用します。環境によっては`diff`が無い場合があるため、必要に応じてインストールしてください。
-- 現状のFUSEレイヤはwatch listを参照していません（将来的にファイルシステム側でもフィルタリング予定）。
+- 複数エージェント/シェルで同一UIDを共有する場合は環境変数`LIT_SESSION_ID=<任意のセッション名>`を設定してください。watch list・ロック情報はセッションごとに分離され、PIDが停止した場合のみ別PIDからロック解除できます。
 
 ## 開発
 

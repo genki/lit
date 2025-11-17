@@ -83,7 +83,7 @@ enum Commands {
     Version,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 struct SyncArgs {
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     remote: String,
@@ -95,6 +95,9 @@ struct SyncArgs {
     file: Option<PathBuf>,
     #[arg(long)]
     blob: bool,
+    /// 指定すると同期を周期実行
+    #[arg(long)]
+    repeat: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -130,6 +133,9 @@ struct WatchArgs {
     /// Files/directories to add/remove from tracking
     #[arg(required = true)]
     paths: Vec<PathBuf>,
+    /// update shared(global) watch list instead of session-local
+    #[arg(long)]
+    global: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -143,6 +149,12 @@ struct DropArgs {
 struct LogArgs {
     /// Optional file/directory to inspect
     path: Option<PathBuf>,
+    /// Continuously watch changes
+    #[arg(long)]
+    watch: bool,
+    /// Interval seconds for --watch
+    #[arg(long, default_value_t = 5)]
+    interval: u64,
 }
 
 #[tokio::main]
@@ -172,6 +184,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
+    if let Some(interval) = args.repeat {
+        loop {
+            run_sync_once(&args).await?;
+            sleep(Duration::from_secs(interval)).await;
+        }
+    } else {
+        run_sync_once(&args).await?;
+    }
+    Ok(())
+}
+
+async fn run_sync_once(args: &SyncArgs) -> anyhow::Result<()> {
     let mut client = relay_client(&args.remote).await?;
     let host = hostname();
     let node_id = args
@@ -195,7 +219,7 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
     attach_auth(&mut stream_req, args.token.as_deref())?;
     let mut ack_stream = client.stream_ops(stream_req).await?.into_inner();
 
-    if let Some(path) = args.file {
+    if let Some(path) = args.file.clone() {
         let data = fs::read(&path)
             .await
             .with_context(|| format!("failed to read {:?}", path))?;
@@ -330,13 +354,22 @@ async fn run_status() -> anyhow::Result<()> {
             println!(" mountpoint: {}", ctx.mountpoint.display());
             println!(" lower: {}", ctx.lower.display());
             println!(" upper: {}", ctx.upper.display());
-            let watch = load_watchlist(&ctx.root)?;
-            if watch.is_empty() {
+            let session = session_id()?;
+            let watchlists = load_watchlists(&ctx.root, &session)?;
+            if watchlists.global.is_empty() && watchlists.session.is_empty() {
                 println!(" tracked: (none)");
             } else {
-                println!(" tracked:");
-                for path in watch.into_iter().collect::<BTreeSet<_>>() {
-                    println!("  {}", path);
+                if !watchlists.global.is_empty() {
+                    println!(" tracked (global):");
+                    for path in watchlists.global.iter().cloned().collect::<BTreeSet<_>>() {
+                        println!("  {}", path);
+                    }
+                }
+                if !watchlists.session.is_empty() {
+                    println!(" tracked (session {}):", session);
+                    for path in watchlists.session.iter().cloned().collect::<BTreeSet<_>>() {
+                        println!("  {}", path);
+                    }
                 }
             }
         }
@@ -371,7 +404,7 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&work).await?;
 
     if !workspace_exists {
-        save_watchlist(&workspace_root, &HashSet::new())?;
+        save_watchlist_scope(&workspace_root, WatchScope::Global, &HashSet::new())?;
     }
     move_existing_contents(&canonical_target, &lower)?;
     write_workspace_marker(&lower, &workspace_id)?;
@@ -749,6 +782,64 @@ struct WatchState {
     paths: Vec<String>,
 }
 
+struct WatchLists {
+    global: HashSet<String>,
+    session: HashSet<String>,
+}
+
+enum WatchScope<'a> {
+    Global,
+    Session(&'a str),
+}
+
+fn load_watchlists(root: &Path, session: &str) -> anyhow::Result<WatchLists> {
+    let global = load_watchlist_file(&watchlist_path(root))?;
+    let session_set = load_watchlist_file(&watch_session_path(root, session))?;
+    Ok(WatchLists {
+        global,
+        session: session_set,
+    })
+}
+
+fn save_watchlist_scope(
+    root: &Path,
+    scope: WatchScope,
+    watch: &HashSet<String>,
+) -> anyhow::Result<()> {
+    match scope {
+        WatchScope::Global => save_watchlist_file(&watchlist_path(root), watch),
+        WatchScope::Session(session) => {
+            save_watchlist_file(&watch_session_path(root, session), watch)
+        }
+    }
+}
+
+fn combined_watchlist(lists: &WatchLists) -> HashSet<String> {
+    let mut set = lists.global.clone();
+    set.extend(lists.session.iter().cloned());
+    set
+}
+
+fn session_id() -> anyhow::Result<String> {
+    if let Ok(value) = env::var("LIT_SESSION_ID") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let path = lit_home_dir()?.join("session-id");
+    if path.exists() {
+        let contents = std::fs::read_to_string(&path)?;
+        let trimmed = contents.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let generated = format!("default-{}", Uuid::new_v4());
+    std::fs::write(&path, &generated)?;
+    Ok(generated)
+}
+
 #[derive(Serialize, Deserialize)]
 struct TagMetadata {
     name: String,
@@ -769,6 +860,8 @@ struct LockEntry {
     message: Option<String>,
     created_at: i64,
     expires_at: Option<i64>,
+    #[serde(default)]
+    owner_session: String,
 }
 
 impl LockEntry {
@@ -781,22 +874,31 @@ fn watchlist_path(root: &Path) -> PathBuf {
     root.join("watch.json")
 }
 
-fn load_watchlist(root: &Path) -> anyhow::Result<HashSet<String>> {
-    let path = watchlist_path(root);
+fn watch_session_dir(root: &Path) -> PathBuf {
+    root.join("watch")
+}
+
+fn watch_session_path(root: &Path, session: &str) -> PathBuf {
+    watch_session_dir(root).join(format!("{session}.json"))
+}
+
+fn load_watchlist_file(path: &Path) -> anyhow::Result<HashSet<String>> {
     if !path.exists() {
         return Ok(HashSet::new());
     }
-    let bytes = std::fs::read(&path)?;
+    let bytes = std::fs::read(path)?;
     let state: WatchState = serde_json::from_slice(&bytes)?;
     Ok(state.paths.into_iter().collect())
 }
 
-fn save_watchlist(root: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
-    std::fs::create_dir_all(root)?;
+fn save_watchlist_file(path: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut entries: Vec<_> = watch.iter().cloned().collect();
     entries.sort();
     let state = WatchState { paths: entries };
-    std::fs::write(watchlist_path(root), serde_json::to_vec_pretty(&state)?)?;
+    std::fs::write(path, serde_json::to_vec_pretty(&state)?)?;
     Ok(())
 }
 
@@ -934,36 +1036,71 @@ fn list_locks(root: &Path) -> anyhow::Result<()> {
         if let Some(exp) = entry.expires_at {
             line.push_str(&format!(" (expires {})", format_timestamp(exp)));
         }
+        if !entry.owner_session.is_empty() {
+            line.push_str(&format!(" session={}", entry.owner_session));
+        }
         println!("{}", line);
+    }
+    Ok(())
+}
+
+fn ensure_session_exclusive(ctx: &WorkspaceContext) -> anyhow::Result<()> {
+    let session = session_id()?;
+    let state = load_locks(&ctx.root)?;
+    let now = unix_timestamp();
+    for entry in state.locks {
+        if entry.is_expired(now) {
+            continue;
+        }
+        if entry.owner_session.is_empty() || entry.owner_session == session {
+            continue;
+        }
+        return Err(anyhow!(
+            "lock held by session {} on {}; aborting",
+            entry.owner_session,
+            entry.path
+        ));
     }
     Ok(())
 }
 
 async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
-    let mut watch = load_watchlist(&ctx.root)?;
+    let session = session_id()?;
+    let mut lists = load_watchlists(&ctx.root, &session)?;
+    let target = if args.global {
+        &mut lists.global
+    } else {
+        &mut lists.session
+    };
     for path in args.paths {
         let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
         if add {
             ensure_lower_entry(&ctx.lower, &ctx.mountpoint, &rel)?;
-            if watch.insert(rel.clone()) {
+            if target.insert(rel.clone()) {
                 println!("added {rel}");
             } else {
                 println!("already tracking {rel}");
             }
-        } else if watch.remove(&rel) {
+        } else if target.remove(&rel) {
             println!("removed {rel}");
         } else {
             println!("not tracked {rel}");
         }
     }
-    save_watchlist(&ctx.root, &watch)?;
+    let scope = if args.global {
+        WatchScope::Global
+    } else {
+        WatchScope::Session(&session)
+    };
+    save_watchlist_scope(&ctx.root, scope, target)?;
     Ok(())
 }
 
 async fn run_tag(args: TagArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     if let Some(name) = args.name {
+        ensure_session_exclusive(&ctx)?;
         validate_tag_name(&name)?;
         let tag_dir = tag_dir(&ctx.root, &name);
         if tag_dir.exists() {
@@ -991,6 +1128,7 @@ async fn run_tag(args: TagArgs) -> anyhow::Result<()> {
 
 async fn run_reset(args: ResetArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
+    ensure_session_exclusive(&ctx)?;
     validate_tag_name(&args.name)?;
     let tree_path = tag_tree_path(&ctx.root, &args.name);
     if !tree_path.exists() {
@@ -1006,6 +1144,7 @@ async fn run_reset(args: ResetArgs) -> anyhow::Result<()> {
 
 async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
+    let session = session_id()?;
     if let Some(path) = args.path {
         let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
         let mut state = load_locks(&ctx.root)?;
@@ -1016,20 +1155,44 @@ async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
             .iter()
             .find(|entry| entry.path == rel && !entry.is_expired(now))
         {
+            let locker_alive = pid_alive(existing.owner_pid);
+            let same_session =
+                !existing.owner_session.is_empty() && existing.owner_session == session;
             if existing.owner_uid == current_uid() {
-                if existing.owner_pid != current_pid() && pid_alive(existing.owner_pid) {
+                if same_session {
+                    if existing.owner_pid != current_pid() && locker_alive {
+                        let msg = existing
+                            .message
+                            .as_deref()
+                            .unwrap_or("locked by another process");
+                        return Err(anyhow!(
+                            "{} is already locked by session {} (pid {} still active): {}",
+                            rel,
+                            existing.owner_session,
+                            existing.owner_pid,
+                            msg
+                        ));
+                    }
+                } else if locker_alive {
                     let msg = existing
                         .message
                         .as_deref()
                         .unwrap_or("locked by another process");
+                    let owner_session = if existing.owner_session.is_empty() {
+                        "<unknown>"
+                    } else {
+                        &existing.owner_session
+                    };
                     return Err(anyhow!(
-                        "{} is already locked by your uid (pid {} still active): {}",
+                        "{} is locked by uid {} session {} pid {}: {}",
                         rel,
+                        existing.owner_uid,
+                        owner_session,
                         existing.owner_pid,
                         msg
                     ));
                 }
-            } else {
+            } else if locker_alive {
                 let msg = existing
                     .message
                     .as_deref()
@@ -1051,6 +1214,7 @@ async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
             message: args.message.clone(),
             created_at: now,
             expires_at,
+            owner_session: session.clone(),
         };
         state.locks.retain(|e| e.path != rel);
         state.locks.push(entry);
@@ -1074,9 +1238,9 @@ async fn run_unlock(args: UnlockArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
     let rel = relative_to_workspace(&args.path, &ctx.mountpoint).await?;
     let mut state = load_locks(&ctx.root)?;
-    let before = state.locks.len();
     let current_uid = current_uid();
     let current_pid = current_pid();
+    let mut removed = false;
     state.locks.retain(|entry| {
         if entry.path != rel {
             return true;
@@ -1084,12 +1248,17 @@ async fn run_unlock(args: UnlockArgs) -> anyhow::Result<()> {
         if entry.owner_uid != current_uid {
             return true;
         }
-        if entry.owner_pid == current_pid || !pid_alive(entry.owner_pid) {
+        if entry.owner_pid == current_pid {
+            removed = true;
+            return false;
+        }
+        if !pid_alive(entry.owner_pid) {
+            removed = true;
             return false;
         }
         true
     });
-    if state.locks.len() == before {
+    if !removed {
         return Err(anyhow!(
             "no lock held by uid={} on {} (locker pid still running)",
             current_uid,
@@ -1103,7 +1272,8 @@ async fn run_unlock(args: UnlockArgs) -> anyhow::Result<()> {
 
 async fn run_drop(args: DropArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
-    let mut watch = load_watchlist(&ctx.root)?;
+    let session = session_id()?;
+    let mut watchlists = load_watchlists(&ctx.root, &session)?;
     let mut watch_changed = false;
     for path in args.paths {
         let rel = match relative_to_workspace(&path, &ctx.mountpoint).await {
@@ -1112,7 +1282,8 @@ async fn run_drop(args: DropArgs) -> anyhow::Result<()> {
                 let fallback =
                     fallback_relative_path(&path, &ctx.mountpoint).map(|p| normalize_relative(&p));
                 if let Some(candidate) = fallback {
-                    if watch.contains(&candidate)
+                    if watchlists.session.contains(&candidate)
+                        || watchlists.global.contains(&candidate)
                         || ctx.lower.join(&candidate).exists()
                         || ctx.upper.join(&candidate).exists()
                     {
@@ -1126,13 +1297,18 @@ async fn run_drop(args: DropArgs) -> anyhow::Result<()> {
             }
         };
         drop_target(&ctx, &rel)?;
-        if watch.remove(&rel) {
+        if watchlists.session.remove(&rel) || watchlists.global.remove(&rel) {
             watch_changed = true;
         }
         println!("dropped {}", rel);
     }
     if watch_changed {
-        save_watchlist(&ctx.root, &watch)?;
+        save_watchlist_scope(
+            &ctx.root,
+            WatchScope::Session(&session),
+            &watchlists.session,
+        )?;
+        save_watchlist_scope(&ctx.root, WatchScope::Global, &watchlists.global)?;
     }
     Ok(())
 }
@@ -1214,11 +1390,13 @@ fn crdt_doc_path(root: &Path, rel: &str) -> PathBuf {
 
 async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
-    let watch = load_watchlist(&ctx.root)?;
+    let session = session_id()?;
+    let watchlists = load_watchlists(&ctx.root, &session)?;
     ensure_lower_snapshot(&ctx.lower, &ctx.mountpoint)?;
+    let base_watch = combined_watchlist(&watchlists);
     let targets: Vec<String> = if let Some(path) = args.path {
         let rel = relative_to_workspace(&path, &ctx.mountpoint).await?;
-        if !watch.contains(&rel) {
+        if !base_watch.contains(&rel) {
             println!(
                 "lit log: {} is not tracked; use `lit add {}` first",
                 rel, rel
@@ -1227,18 +1405,36 @@ async fn run_log(args: LogArgs) -> anyhow::Result<()> {
         }
         vec![rel]
     } else {
-        watch.into_iter().collect()
+        base_watch.into_iter().collect()
     };
     if targets.is_empty() {
         println!("lit log: no tracked paths");
         return Ok(());
     }
+    if args.watch {
+        loop {
+            let output = build_log_output(&ctx, &targets)?;
+            println!(
+                "== lit log @ {} ==\n{}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                output
+            );
+            sleep(Duration::from_secs(args.interval)).await;
+        }
+    } else {
+        let output = build_log_output(&ctx, &targets)?;
+        display_with_pager(&output)?;
+    }
+    Ok(())
+}
+
+fn build_log_output(ctx: &WorkspaceContext, targets: &[String]) -> anyhow::Result<String> {
     let mut output = String::new();
     for rel in targets {
-        update_crdt_document(&ctx, &rel)?;
-        ensure_lower_entry(&ctx.lower, &ctx.mountpoint, &rel)?;
-        let mount_path = ctx.mountpoint.join(&rel);
-        let lower_path = ctx.lower.join(&rel);
+        update_crdt_document(ctx, rel)?;
+        ensure_lower_entry(&ctx.lower, &ctx.mountpoint, rel)?;
+        let mount_path = ctx.mountpoint.join(rel);
+        let lower_path = ctx.lower.join(rel);
         let diff = generate_diff(&lower_path, &mount_path)?;
         if diff.is_empty() {
             output.push_str(&format!("diff -- lit {rel}: no changes\n\n"));
@@ -1254,8 +1450,7 @@ async fn run_log(args: LogArgs) -> anyhow::Result<()> {
     if output.is_empty() {
         output.push_str("lit log: no changes\n");
     }
-    display_with_pager(&output)?;
-    Ok(())
+    Ok(output)
 }
 
 fn generate_diff(lower: &Path, mount: &Path) -> anyhow::Result<String> {
