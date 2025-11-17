@@ -82,6 +82,10 @@ enum Commands {
     Log(LogArgs),
     /// Show CLI version information
     Version,
+    /// Show status for specific path
+    Info(InfoArgs),
+    /// List currently mounted lit workspaces
+    Ls,
     /// Generate shell completion scripts
     Completions(CompletionArgs),
 }
@@ -167,6 +171,12 @@ struct CompletionArgs {
     shell: Shell,
 }
 
+#[derive(clap::Args, Debug)]
+struct InfoArgs {
+    /// Path to inspect
+    path: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -187,9 +197,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Unlock(args)) => run_unlock(args).await?,
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
+        Some(Commands::Info(args)) => run_info(args).await?,
+        Some(Commands::Ls) => run_ls().await?,
         Some(Commands::Completions(args)) => run_completions(args)?,
         Some(Commands::Version) => run_version(),
-        None => run_status().await?,
+        None => run_status(None).await?,
     }
     Ok(())
 }
@@ -209,6 +221,46 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
 fn run_completions(args: CompletionArgs) -> anyhow::Result<()> {
     let mut cmd = Cli::command();
     clap_complete::generate(args.shell, &mut cmd, "lit", &mut io::stdout());
+    Ok(())
+}
+
+async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
+    run_status(Some(args.path)).await
+}
+
+#[derive(Deserialize)]
+struct WorkspaceConfig {
+    workspace_id: String,
+    mountpoint: PathBuf,
+    lower: PathBuf,
+    upper: PathBuf,
+    work: PathBuf,
+}
+
+async fn run_ls() -> anyhow::Result<()> {
+    let root = lit_home_dir()?.join("workspaces");
+    if !root.exists() {
+        println!("lit ls: no workspaces");
+        return Ok(());
+    }
+    let mut found = false;
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let meta_path = entry.path().join("workspace.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&meta_path)?;
+        if let Ok(cfg) = serde_json::from_slice::<WorkspaceConfig>(&bytes) {
+            if is_path_mounted(&cfg.mountpoint)? {
+                found = true;
+                println!("{} -> {}", cfg.workspace_id, cfg.mountpoint.display());
+            }
+        }
+    }
+    if !found {
+        println!("lit ls: no mounted workspaces");
+    }
     Ok(())
 }
 
@@ -356,9 +408,12 @@ fn run_version() {
     println!("lit {}", env!("CARGO_PKG_VERSION"));
 }
 
-async fn run_status() -> anyhow::Result<()> {
-    let target = std::env::current_dir()?;
-    let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
+async fn run_status(target: Option<PathBuf>) -> anyhow::Result<()> {
+    let base = match target {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+    let canonical = fs::canonicalize(&base).await.unwrap_or(base.clone());
     match workspace_context_from_mount(canonical.clone()).await {
         Ok(ctx) => {
             let state = if is_path_mounted(&ctx.mountpoint)? {

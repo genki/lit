@@ -29,6 +29,8 @@ source ~/.bashrc
 | `lit on [path]` | ディレクトリを初期化＆マウント（省略時はCWD） |
 | `lit off [path]` | マウント解除し、lower→ターゲットへ最新状態を復元 |
 | `lit` | 現在のworkspaceステータス（ON/OFF、watch listなど）を表示 |
+| `lit info <path>` | 指定ディレクトリで`lit`を実行したのと同じ情報を表示 |
+| `lit ls` | 現ユーザーでON状態のlitワークスペースを一覧 |
 | `lit add <path...>` | セッション固有watch listに追加（`--global`で共有） |
 | `lit rm <path...>` | セッション固有watch listから除外（`--global`で共有分も削除） |
 | `lit drop <path...>` | 指定ファイル/ディレクトリとその履歴を完全削除 |

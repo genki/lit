@@ -12,6 +12,8 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 | `lit on [dir]` | ディレクトリをlit管理下に移行し`lit-fs`をマウント | なし | `dir`省略時はCWD。`lower/upper/work`を`~/.lit/workspaces/<id>/`配下に作成 |
 | `lit off [dir]` | FUSEマウントを解除し最新内容をターゲットに戻す | なし | アンマウント後は通常ディレクトリとして扱える |
 | `lit` | 現在のステータスを表示 | なし | ON/OFF、workspace ID、watch listを表示 |
+| `lit info <path>` | 指定パスのステータスを表示 | なし | `cd <path>; lit` と同等 |
+| `lit ls` | 現在ONなワークスペースを列挙 | なし | `~/.lit/workspaces`をスキャンしてマウント中のみ表示 |
 | `lit add <path...>` / `lit rm <path...>` | watch listへ追加/削除 | なし | `watch.json`に追跡対象を記録し、`lit log`の対象を制御 |
 | `lit drop <path...>` | ファイルと履歴(CRDT/スナップショット)を完全削除 | なし | `lower/upper/mountpoint`から対象を除去 |
 | `lit log [path]` | watch対象の差分を`diff -u`形式で表示 | `path`を指定すると単一エントリ | 表示時にAutomergeドキュメントへ反映 |
