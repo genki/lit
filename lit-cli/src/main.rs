@@ -682,6 +682,11 @@ fn current_pid() -> u32 {
     std::process::id()
 }
 
+fn pid_alive(pid: u32) -> bool {
+    let path = PathBuf::from(format!("/proc/{pid}"));
+    path.exists()
+}
+
 fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
     let marker_dir = lower.join(".lit");
     std::fs::create_dir_all(&marker_dir)?;
@@ -1011,7 +1016,20 @@ async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
             .iter()
             .find(|entry| entry.path == rel && !entry.is_expired(now))
         {
-            if existing.owner_uid != current_uid() {
+            if existing.owner_uid == current_uid() {
+                if existing.owner_pid != current_pid() && pid_alive(existing.owner_pid) {
+                    let msg = existing
+                        .message
+                        .as_deref()
+                        .unwrap_or("locked by another process");
+                    return Err(anyhow!(
+                        "{} is already locked by your uid (pid {} still active): {}",
+                        rel,
+                        existing.owner_pid,
+                        msg
+                    ));
+                }
+            } else {
                 let msg = existing
                     .message
                     .as_deref()
@@ -1057,11 +1075,26 @@ async fn run_unlock(args: UnlockArgs) -> anyhow::Result<()> {
     let rel = relative_to_workspace(&args.path, &ctx.mountpoint).await?;
     let mut state = load_locks(&ctx.root)?;
     let before = state.locks.len();
-    state
-        .locks
-        .retain(|entry| !(entry.path == rel && entry.owner_uid == current_uid()));
+    let current_uid = current_uid();
+    let current_pid = current_pid();
+    state.locks.retain(|entry| {
+        if entry.path != rel {
+            return true;
+        }
+        if entry.owner_uid != current_uid {
+            return true;
+        }
+        if entry.owner_pid == current_pid || !pid_alive(entry.owner_pid) {
+            return false;
+        }
+        true
+    });
     if state.locks.len() == before {
-        return Err(anyhow!("no lock held by uid={} on {}", current_uid(), rel));
+        return Err(anyhow!(
+            "no lock held by uid={} on {} (locker pid still running)",
+            current_uid,
+            rel
+        ));
     }
     save_locks(&ctx.root, &state)?;
     println!("unlocked {}", rel);
