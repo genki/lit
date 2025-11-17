@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use chrono::{Local, LocalResult, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use dirs::home_dir;
 use hex::ToHex;
 use libc;
@@ -81,6 +82,8 @@ enum Commands {
     Log(LogArgs),
     /// Show CLI version information
     Version,
+    /// Generate shell completion scripts
+    Completions(CompletionArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -157,6 +160,13 @@ struct LogArgs {
     interval: u64,
 }
 
+#[derive(clap::Args, Debug)]
+struct CompletionArgs {
+    /// Shell type to generate completions for
+    #[arg(value_enum)]
+    shell: Shell,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -177,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Unlock(args)) => run_unlock(args).await?,
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
+        Some(Commands::Completions(args)) => run_completions(args)?,
         Some(Commands::Version) => run_version(),
         None => run_status().await?,
     }
@@ -192,6 +203,12 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
     } else {
         run_sync_once(&args).await?;
     }
+    Ok(())
+}
+
+fn run_completions(args: CompletionArgs) -> anyhow::Result<()> {
+    let mut cmd = Cli::command();
+    clap_complete::generate(args.shell, &mut cmd, "lit", &mut io::stdout());
     Ok(())
 }
 

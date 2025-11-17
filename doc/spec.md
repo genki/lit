@@ -22,6 +22,7 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 | `lit sync --remote <url>` | `lit-relay`と操作ログ/Blobを同期 | `--token`, `--send-file`, `--blob` | Operation/BlobをgRPC経由で送信、ACKを受信 |
 | `lit blob-fetch --path <p> --version <id>` | RelayからBlobを取得 | `--output` | `lit sync --blob`で保存したバージョンIDを利用 |
 | `lit version` | CLIビルドバージョン表示 | なし | `cargo pkg version`を出力 |
+| `lit completions <shell>` | シェル補完スクリプトを生成 | bash/zsh/fish/powershell/elvish | `lit completions bash > /etc/bash_completion.d/lit` 等で利用 |
 
 - CLIは`$HOME/.lit`配下にworkspace状態(`workspaces/<id>/`)、ロック(`locks.json`)、watch list、CRDTファイルを保存し、`lit-fs`デーモンを自動起動する。
 

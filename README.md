@@ -41,6 +41,7 @@ source ~/.bashrc
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |
 | `lit version` | CLIのバージョン情報を表示 |
+| `lit completions <shell>` | bash/zsh/fish などの補完スクリプトを出力 |
 
 `lit log --watch --interval 5`で差分を定期監視したり、`lit sync --remote <url> --repeat 30`でリレー同期を自動実行したりといった常駐モードも利用できます。
 
