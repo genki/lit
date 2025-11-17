@@ -23,6 +23,8 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 | `lit unlock <path>` | 自分のUIDが保持するロックを解除 | なし | locker PIDが死亡していれば別PIDからでも解除可 |
 | `lit sync --remote <url>` | `lit-relay`と操作ログ/Blobを同期 | `--token`, `--send-file`, `--blob` | Operation/BlobをgRPC経由で送信、ACKを受信 |
 | `lit blob-fetch --path <p> --version <id>` | RelayからBlobを取得 | `--output` | `lit sync --blob`で保存したバージョンIDを利用 |
+| `lit start [url]` | ローカルrelayを起動、または指定URLへの自動同期を開始 | なし / `url` | relayはユーザーごと1つ。`url`指定時は全ワークスペースで定期的に`lit sync`を行う |
+| `lit stop` | relay/syncデーモンを停止 | なし | `lit start`で起動した常駐プロセスをまとめて終了 |
 | `lit version` | CLIビルドバージョン表示 | なし | `cargo pkg version`を出力 |
 | `lit completions <shell>` | シェル補完スクリプトを生成 | bash/zsh/fish/powershell/elvish | `lit completions bash > /etc/bash_completion.d/lit` 等で利用 |
 

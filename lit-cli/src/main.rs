@@ -40,6 +40,8 @@ mod proto {
 
 mod mount;
 
+const DEFAULT_RELAY_ADDR: &str = "127.0.0.1:5151";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lit",
@@ -80,12 +82,19 @@ enum Commands {
     Drop(DropArgs),
     /// Show diff between lower snapshot and current workspace
     Log(LogArgs),
-    /// Show CLI version information
-    Version,
     /// Show status for specific path
     Info(InfoArgs),
     /// List currently mounted lit workspaces
     Ls,
+    /// Start local relay or remote sync
+    Start(StartArgs),
+    /// Stop relay/sync daemons
+    Stop,
+    /// Run daemon tasks (internal)
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
+    /// Show CLI version information
+    Version,
     /// Generate shell completion scripts
     Completions(CompletionArgs),
 }
@@ -177,6 +186,27 @@ struct InfoArgs {
     path: PathBuf,
 }
 
+#[derive(clap::Args, Debug)]
+struct StartArgs {
+    /// Optional remote URL to sync with
+    url: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct DaemonArgs {
+    #[arg(value_enum)]
+    mode: DaemonMode,
+    #[arg(long)]
+    remote: Option<String>,
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DaemonMode {
+    Sync,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -199,6 +229,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Info(args)) => run_info(args).await?,
         Some(Commands::Ls) => run_ls().await?,
+        Some(Commands::Start(args)) => run_start(args).await?,
+        Some(Commands::Stop) => run_stop().await?,
+        Some(Commands::Daemon(args)) => run_daemon(args).await?,
         Some(Commands::Completions(args)) => run_completions(args)?,
         Some(Commands::Version) => run_version(),
         None => run_status(None).await?,
@@ -228,7 +261,157 @@ async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
     run_status(Some(args.path)).await
 }
 
+async fn run_start(args: StartArgs) -> anyhow::Result<()> {
+    let mut state = load_daemon_state()?;
+    if let Some(pid) = state.relay_pid {
+        if !process_alive(pid) {
+            state.relay_pid = None;
+        }
+    }
+    if let Some(pid) = state.sync_pid {
+        if !process_alive(pid) {
+            state.sync_pid = None;
+            state.sync_remote = None;
+        }
+    }
+
+    match args.url {
+        Some(url) => {
+            if let Some(pid) = state.sync_pid {
+                if process_alive(pid) {
+                    println!(
+                        "lit: sync daemon already running (pid {}) targeting {}",
+                        pid,
+                        state.sync_remote.as_deref().unwrap_or("unknown")
+                    );
+                    return Ok(());
+                }
+            }
+            let exe = std::env::current_exe()?;
+            let child = Command::new(exe)
+                .arg("daemon")
+                .arg("--mode")
+                .arg("sync")
+                .arg("--remote")
+                .arg(&url)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("failed to start sync daemon")?;
+            state.sync_pid = Some(child.id());
+            state.sync_remote = Some(url.clone());
+            save_daemon_state(&state)?;
+            println!("lit: sync daemon started (pid {})", child.id());
+        }
+        None => {
+            if let Some(pid) = state.relay_pid {
+                if process_alive(pid) {
+                    println!(
+                        "lit: relay already running at {} (pid {})",
+                        state.relay_addr.as_deref().unwrap_or(DEFAULT_RELAY_ADDR),
+                        pid
+                    );
+                    return Ok(());
+                }
+            }
+            let storage = lit_home_dir()?.join("relay");
+            std::fs::create_dir_all(&storage)?;
+            let addr = state
+                .relay_addr
+                .clone()
+                .unwrap_or_else(|| DEFAULT_RELAY_ADDR.to_string());
+            let child = Command::new("lit-relay")
+                .arg("--listen")
+                .arg(&addr)
+                .arg("--storage-root")
+                .arg(&storage)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("failed to start lit-relay")?;
+            state.relay_pid = Some(child.id());
+            state.relay_addr = Some(addr);
+            state.relay_storage = Some(storage);
+            save_daemon_state(&state)?;
+            println!("lit: relay started (pid {})", child.id());
+        }
+    }
+    Ok(())
+}
+
+async fn run_stop() -> anyhow::Result<()> {
+    let mut state = load_daemon_state()?;
+    if let Some(pid) = state.sync_pid {
+        if process_alive(pid) {
+            match terminate_process(pid) {
+                Ok(_) => println!("lit: stopped sync daemon pid {pid}"),
+                Err(err) => eprintln!("lit: failed to stop sync daemon: {err}"),
+            }
+        }
+        state.sync_pid = None;
+        state.sync_remote = None;
+    }
+    if let Some(pid) = state.relay_pid {
+        if process_alive(pid) {
+            match terminate_process(pid) {
+                Ok(_) => println!("lit: stopped relay pid {pid}"),
+                Err(err) => eprintln!("lit: failed to stop relay: {err}"),
+            }
+        }
+        state.relay_pid = None;
+        state.relay_addr = None;
+        state.relay_storage = None;
+    }
+    save_daemon_state(&state)?;
+    Ok(())
+}
+
+async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
+    match args.mode {
+        DaemonMode::Sync => {
+            let remote = args
+                .remote
+                .ok_or_else(|| anyhow!("--remote is required for sync daemon"))?;
+            daemon_sync_loop(remote, args.interval).await?
+        }
+    }
+    Ok(())
+}
+
+async fn daemon_sync_loop(remote: String, interval: u64) -> anyhow::Result<()> {
+    loop {
+        sync_all_workspaces(&remote).await?;
+        sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+async fn sync_all_workspaces(remote: &str) -> anyhow::Result<()> {
+    let root = lit_home_dir()?.join("workspaces");
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let sync_args = SyncArgs {
+            remote: remote.to_string(),
+            token: None,
+            node_id: None,
+            file: None,
+            blob: false,
+            repeat: None,
+        };
+        if let Err(err) = run_sync_once(&sync_args).await {
+            eprintln!("lit daemon: sync error: {err}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct WorkspaceConfig {
     workspace_id: String,
     mountpoint: PathBuf,
@@ -892,6 +1075,41 @@ fn combined_watchlist(lists: &WatchLists) -> HashSet<String> {
     set
 }
 
+fn daemon_state_path() -> anyhow::Result<PathBuf> {
+    Ok(lit_home_dir()?.join("daemon.json"))
+}
+
+fn load_daemon_state() -> anyhow::Result<DaemonState> {
+    let path = daemon_state_path()?;
+    if !path.exists() {
+        return Ok(DaemonState::default());
+    }
+    let bytes = std::fs::read(&path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn save_daemon_state(state: &DaemonState) -> anyhow::Result<()> {
+    let path = daemon_state_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+fn process_alive(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+fn terminate_process(pid: u32) -> anyhow::Result<()> {
+    unsafe {
+        if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+            return Err(anyhow!("failed to terminate pid {}", pid));
+        }
+    }
+    Ok(())
+}
+
 fn session_id() -> anyhow::Result<String> {
     if let Ok(value) = env::var("LIT_SESSION_ID") {
         let trimmed = value.trim();
@@ -934,6 +1152,15 @@ struct LockEntry {
     expires_at: Option<i64>,
     #[serde(default)]
     owner_session: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct DaemonState {
+    relay_pid: Option<u32>,
+    relay_addr: Option<String>,
+    relay_storage: Option<PathBuf>,
+    sync_pid: Option<u32>,
+    sync_remote: Option<String>,
 }
 
 impl LockEntry {

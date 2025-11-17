@@ -42,6 +42,8 @@ source ~/.bashrc
 | `lit log [path]` | watch対象（または指定パス）の現在差分をpagerで表示 |
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |
+| `lit start [url]` | ローカルrelay起動または`url`への定期同期を開始 |
+| `lit stop` | relay/syncデーモンを停止 |
 | `lit version` | CLIのバージョン情報を表示 |
 | `lit completions <shell>` | bash/zsh/fish などの補完スクリプトを出力 |
 
