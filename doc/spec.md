@@ -30,6 +30,11 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 - `lit off`は`fusermount3 -u`でアンマウントし、`upper`の内容をターゲットへ戻す。`lower`はベースラインとして保持され、次回`lit log`で差分を計算する際の参照になる。
 - watch listは共有(`watch.json`)とセッション別(`watch/<session>.json`)に分かれており、`lit add/rm`はデフォルトでセッション側を更新する。セッションIDは環境変数`LIT_SESSION_ID`で外部から指定でき、未設定時はCLIが自動生成する。`lit log`は両者の和集合のみを対象に`diff`を生成し、Automergeベースの`lit-crdt`ドキュメントに反映する。
 
+#### セッションIDの扱い
+- CLIは起動時に環境変数`LIT_SESSION_ID`を参照し、未設定の場合は`~/.lit/session-id`から既存IDを読み取る。ファイルにもIDが存在しない場合は`default-<UUID>`形式で新規IDを生成し、以後同じ値を再利用する。
+- watch listはグローバル(`watch.json`)とセッション別(`watch/<session>.json`)の2階層で管理される。`lit add/rm`はデフォルトでセッション側を更新し、`--global`を付与した場合のみ共通リストを操作する。
+- `lit log`や`lit status`は両リストの和集合を表示する。`lit drop`などwatch listを変化させる操作は、該当パスがどちらのリストにあっても削除する。
+
 ### タグとロック
 - タグは`~/.lit/workspaces/<id>/tags/<name>/tree`にワークスペース全体を複製し、`meta.json`に作成時刻とメッセージを保存する。`lit tag`を引数なしで呼ぶと作成済みタグを時系列で出力し、`lit reset <name>`で任意タグへ復元できる。
 - ロック情報は`locks.json`に配列で保存され、各エントリに`path`, `owner_uid`, `owner_pid`, `owner_session`, `message`, `expires_at`を持つ。`lit lock <path>`は同一UIDかつ同一セッション(`LIT_SESSION_ID`)ならPIDの死活を確認して再取得でき、`lit unlock <path>`は元PIDが存在しない場合に同UIDの別PIDから解除できる。`lit-fs`は書き込み系操作(write/mkdir/create/unlink)の前に`locks.json`を読み込み、UID/PIDが一致しない操作をEACCESで拒否しつつメッセージをstderrへ出力する。
