@@ -13,7 +13,7 @@ litはFUSEベースでディレクトリ全体をマウントし、編集操作�
 ## インストール
 
 ```bash
-sudo apt-get install -y fuse-overlayfs libfuse3-dev
+sudo apt-get install -y libfuse3-dev
 git clone https://github.com/genki/lit.git
 cd lit
 . "$HOME/.cargo/env"
@@ -52,7 +52,7 @@ source ~/.bashrc
 
 ## 注意事項
 
-- `lit on`/`lit off`は内部で`fuse-overlayfs`/`fusermount3`を呼び出します。インストール済みであることを確認してください。
+- `lit on`/`lit off`は内部で自前の`lit-fs`デーモン(libfuseベース)と`fusermount3`を利用します。`libfuse3`がインストールされていることを確認してください。
 - watch listに登録していないパスは追跡されません。`lit track`で管理したいパスを明示的に追加してください。
 - `lit log`は`diff`コマンドを利用します。環境によっては`diff`が無い場合があるため、必要に応じてインストールしてください。
 - 現状のFUSEレイヤはwatch listを参照していません（将来的にファイルシステム側でもフィルタリング予定）。
