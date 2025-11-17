@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use chrono::{Local, LocalResult, TimeZone};
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
 use hex::ToHex;
@@ -66,10 +67,12 @@ enum Commands {
     /// Remove files/directories from watch list
     #[command(alias = "untrack")]
     Rm(WatchArgs),
-    /// Create a tag for current workspace state
+    /// Tag operations (create or list)
     Tag(TagArgs),
     /// Reset workspace to a tagged state
     Reset(ResetArgs),
+    /// Acquire a lock on a path
+    Lock(LockArgs),
     /// Drop files and purge their history
     Drop(DropArgs),
     /// Show diff between lower snapshot and current workspace
@@ -156,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Rm(args)) => run_watch_args(args, false).await?,
         Some(Commands::Tag(args)) => run_tag(args).await?,
         Some(Commands::Reset(args)) => run_reset(args).await?,
+        Some(Commands::Lock(args)) => run_lock(args).await?,
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Version) => run_version(),
@@ -378,7 +382,8 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
         &work,
     )?;
 
-    spawn_lit_fs_daemon(&upper, &canonical_target)?;
+    let locks_file = workspace_root.join("locks.json");
+    spawn_lit_fs_daemon(&upper, &canonical_target, &locks_file)?;
     mount::write_state(
         &workspace_root,
         &mount::MountState {
@@ -666,6 +671,14 @@ fn remove_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+fn current_pid() -> u32 {
+    std::process::id()
+}
+
 fn write_workspace_marker(lower: &Path, workspace_id: &str) -> anyhow::Result<()> {
     let marker_dir = lower.join(".lit");
     std::fs::create_dir_all(&marker_dir)?;
@@ -708,7 +721,7 @@ fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path) -> anyhow::Result<()> {
+fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path, locks_file: &Path) -> anyhow::Result<()> {
     let bin = which::which("lit-fs").context("lit-fs binary not found")?;
     std::fs::create_dir_all(source)?;
     Command::new(bin)
@@ -716,8 +729,8 @@ fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path) -> anyhow::Result<()> {
         .arg(source)
         .arg("--mountpoint")
         .arg(mountpoint)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .arg("--locks-file")
+        .arg(locks_file)
         .spawn()
         .map(|_| ())
         .map_err(|e| anyhow!("failed to spawn lit-fs: {e}"))
@@ -733,6 +746,27 @@ struct TagMetadata {
     name: String,
     message: Option<String>,
     created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct LocksState {
+    locks: Vec<LockEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LockEntry {
+    path: String,
+    owner_uid: u32,
+    owner_pid: u32,
+    message: Option<String>,
+    created_at: i64,
+    expires_at: Option<i64>,
+}
+
+impl LockEntry {
+    fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.map(|exp| now > exp).unwrap_or(false)
+    }
 }
 
 fn watchlist_path(root: &Path) -> PathBuf {
@@ -758,6 +792,37 @@ fn save_watchlist(root: &Path, watch: &HashSet<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn lock_state_path(root: &Path) -> PathBuf {
+    root.join("locks.json")
+}
+
+fn load_locks(root: &Path) -> anyhow::Result<LocksState> {
+    let path = lock_state_path(root);
+    if !path.exists() {
+        return Ok(LocksState::default());
+    }
+    let bytes = std::fs::read(&path)?;
+    let mut state: LocksState = serde_json::from_slice(&bytes)?;
+    let now = unix_timestamp();
+    if prune_expired_locks(&mut state, now) {
+        save_locks(root, &state)?;
+    }
+    Ok(state)
+}
+
+fn prune_expired_locks(state: &mut LocksState, now: i64) -> bool {
+    let before = state.locks.len();
+    state.locks.retain(|entry| !entry.is_expired(now));
+    before != state.locks.len()
+}
+
+fn save_locks(root: &Path, state: &LocksState) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let path = lock_state_path(root);
+    std::fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
 fn tags_root(root: &Path) -> PathBuf {
     root.join("tags")
 }
@@ -777,6 +842,44 @@ fn write_tag_metadata(dir: &Path, meta: &TagMetadata) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_tag_metadata(dir: &Path) -> anyhow::Result<TagMetadata> {
+    let meta_path = dir.join("meta.json");
+    let bytes = std::fs::read(meta_path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn list_tags(root: &Path) -> anyhow::Result<()> {
+    let tags_dir = tags_root(root);
+    if !tags_dir.exists() {
+        println!("(no tags)");
+        return Ok(());
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(tags_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Ok(meta) = read_tag_metadata(&entry.path()) {
+                entries.push(meta);
+            }
+        }
+    }
+    if entries.is_empty() {
+        println!("(no tags)");
+        return Ok(());
+    }
+    entries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    for meta in entries {
+        let ts = format_timestamp(meta.created_at);
+        let message = meta.message.unwrap_or_default();
+        if message.is_empty() {
+            println!("{} {}", ts, meta.name);
+        } else {
+            println!("{} {} {}", ts, meta.name, message);
+        }
+    }
+    Ok(())
+}
+
 fn validate_tag_name(name: &str) -> anyhow::Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("tag name cannot be empty"));
@@ -788,6 +891,16 @@ fn validate_tag_name(name: &str) -> anyhow::Result<()> {
         return Err(anyhow!("tag name {} is invalid", name));
     }
     Ok(())
+}
+
+fn format_timestamp(ts: i64) -> String {
+    if ts <= 0 {
+        return "-".into();
+    }
+    match Local.timestamp_opt(ts, 0) {
+        LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => ts.to_string(),
+    }
 }
 
 async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
@@ -814,25 +927,29 @@ async fn run_watch_args(args: WatchArgs, add: bool) -> anyhow::Result<()> {
 
 async fn run_tag(args: TagArgs) -> anyhow::Result<()> {
     let ctx = workspace_context_from_arg(None).await?;
-    validate_tag_name(&args.name)?;
-    let tag_dir = tag_dir(&ctx.root, &args.name);
-    if tag_dir.exists() {
-        return Err(anyhow!("tag {} already exists", args.name));
+    if let Some(name) = args.name {
+        validate_tag_name(&name)?;
+        let tag_dir = tag_dir(&ctx.root, &name);
+        if tag_dir.exists() {
+            return Err(anyhow!("tag {} already exists", name));
+        }
+        let tree_path = tag_tree_path(&ctx.root, &name);
+        clear_directory_contents(&tree_path)?;
+        copy_dir_contents(&ctx.mountpoint, &tree_path)?;
+        let metadata = TagMetadata {
+            name: name.clone(),
+            message: if args.message.is_empty() {
+                None
+            } else {
+                Some(args.message.join(" "))
+            },
+            created_at: unix_timestamp(),
+        };
+        write_tag_metadata(&tag_dir, &metadata)?;
+        println!("created tag {}", name);
+    } else {
+        list_tags(&ctx.root)?;
     }
-    let tree_path = tag_tree_path(&ctx.root, &args.name);
-    clear_directory_contents(&tree_path)?;
-    copy_dir_contents(&ctx.mountpoint, &tree_path)?;
-    let metadata = TagMetadata {
-        name: args.name.clone(),
-        message: if args.message.is_empty() {
-            None
-        } else {
-            Some(args.message.join(" "))
-        },
-        created_at: unix_timestamp(),
-    };
-    write_tag_metadata(&tag_dir, &metadata)?;
-    println!("created tag {}", args.name);
     Ok(())
 }
 
@@ -848,6 +965,55 @@ async fn run_reset(args: ResetArgs) -> anyhow::Result<()> {
     clear_directory_contents(&ctx.lower)?;
     copy_dir_contents(&tree_path, &ctx.lower)?;
     println!("reset to tag {}", args.name);
+    Ok(())
+}
+
+async fn run_lock(args: LockArgs) -> anyhow::Result<()> {
+    let ctx = workspace_context_from_arg(None).await?;
+    let rel = relative_to_workspace(&args.path, &ctx.mountpoint).await?;
+    let mut state = load_locks(&ctx.root)?;
+    let now = unix_timestamp();
+    let expired_removed = prune_expired_locks(&mut state, now);
+    if let Some(existing) = state
+        .locks
+        .iter()
+        .find(|entry| entry.path == rel && !entry.is_expired(now))
+    {
+        if existing.owner_uid != current_uid() || existing.owner_pid != current_pid() {
+            let msg = existing
+                .message
+                .as_deref()
+                .unwrap_or("locked by another process");
+            return Err(anyhow!(
+                "{} is locked by uid {} pid {}: {}",
+                rel,
+                existing.owner_uid,
+                existing.owner_pid,
+                msg
+            ));
+        }
+    }
+    let expires_at = args.timeout.filter(|t| *t > 0).map(|t| now + t as i64);
+    let entry = LockEntry {
+        path: rel.clone(),
+        owner_uid: current_uid(),
+        owner_pid: current_pid(),
+        message: args.message.clone(),
+        created_at: now,
+        expires_at,
+    };
+    state.locks.retain(|e| e.path != rel);
+    state.locks.push(entry);
+    save_locks(&ctx.root, &state)?;
+    if expired_removed {
+        println!("expired locks were cleaned up");
+    }
+    println!(
+        "locked {} (uid={} pid={})",
+        rel,
+        current_uid(),
+        current_pid()
+    );
     Ok(())
 }
 
@@ -1075,9 +1241,9 @@ fn display_with_pager(text: &str) -> anyhow::Result<()> {
 }
 #[derive(clap::Args, Debug)]
 struct TagArgs {
-    /// Tag名
-    name: String,
-    /// 任意のメッセージ
+    /// 作成するタグ名（省略時はタグ一覧を表示）
+    name: Option<String>,
+    /// 任意のメッセージ（タグ作成時のみ）
     #[arg(num_args = 0.., trailing_var_arg = true)]
     message: Vec<String>,
 }
@@ -1086,4 +1252,16 @@ struct TagArgs {
 struct ResetArgs {
     /// 巻き戻すタグ名
     name: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct LockArgs {
+    /// ロック対象のファイル/ディレクトリ
+    path: PathBuf,
+    /// ロックの有効期限（秒）
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// ロック理由のメッセージ
+    #[arg(short = 'm', long = "message")]
+    message: Option<String>,
 }

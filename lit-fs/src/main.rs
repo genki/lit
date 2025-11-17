@@ -4,7 +4,8 @@ use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{ENOENT, ENOSYS};
+use libc::{EACCES, ENOENT, ENOSYS};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -13,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
-use tracing::info;
+use tracing::{info, warn};
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
@@ -24,6 +25,8 @@ struct Args {
     source: PathBuf,
     #[arg(long)]
     mountpoint: PathBuf,
+    #[arg(long)]
+    locks_file: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -64,12 +67,41 @@ impl InodeMap {
 
 struct LitFilesystem {
     inode_map: Mutex<InodeMap>,
+    root: PathBuf,
+    lock_manager: Option<LockManager>,
+}
+
+struct LockManager {
+    file: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+struct LockEntryFs {
+    path: String,
+    owner_uid: u32,
+    owner_pid: u32,
+    message: Option<String>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct LocksStateFs {
+    locks: Vec<LockEntryFs>,
+}
+
+struct LockError {
+    message: String,
 }
 
 impl LitFilesystem {
-    fn new(root: PathBuf) -> Self {
-        let inode_map = Mutex::new(InodeMap::new(root));
-        Self { inode_map }
+    fn new(root: PathBuf, locks_file: Option<PathBuf>) -> Self {
+        let inode_map = Mutex::new(InodeMap::new(root.clone()));
+        let lock_manager = locks_file.map(LockManager::new);
+        Self {
+            inode_map,
+            root,
+            lock_manager,
+        }
     }
 
     fn path_from_parent(&self, parent: u64, name: &OsStr) -> Result<PathBuf> {
@@ -102,6 +134,116 @@ impl LitFilesystem {
             blksize: meta.blksize() as u32,
             flags: 0,
         }
+    }
+
+    fn path_relative_str(&self, path: &Path) -> Option<String> {
+        path.strip_prefix(&self.root)
+            .ok()
+            .map(|rel| normalize_relative_path(rel))
+    }
+
+    fn ensure_can_mutate(&self, req: &Request, path: &Path, op: &str) -> Result<(), libc::c_int> {
+        if let Some(manager) = &self.lock_manager {
+            if let Some(rel) = self.path_relative_str(path) {
+                if let Err(err) = manager.check(&rel, req.uid(), req.pid()) {
+                    warn!(
+                        operation = op,
+                        path = %rel,
+                        uid = req.uid(),
+                        pid = req.pid(),
+                        "blocked by lock: {}",
+                        err.message
+                    );
+                    eprintln!(
+                        "lit-fs: {} on {} denied (uid={} pid={}) -> {}",
+                        op,
+                        rel,
+                        req.uid(),
+                        req.pid(),
+                        err.message
+                    );
+                    return Err(EACCES);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LockManager {
+    fn new(file: PathBuf) -> Self {
+        Self { file }
+    }
+
+    fn check(&self, rel: &str, uid: u32, pid: u32) -> Result<(), LockError> {
+        let state = match self.load_state() {
+            Ok(state) => state,
+            Err(err) => {
+                warn!("failed to load locks: {err}");
+                return Ok(());
+            }
+        };
+        let now = unix_timestamp();
+        for entry in state.locks.into_iter() {
+            if entry.path != rel {
+                continue;
+            }
+            if entry.expires_at.map(|exp| now > exp).unwrap_or(false) {
+                continue;
+            }
+            if entry.owner_uid == uid && entry.owner_pid == pid {
+                return Ok(());
+            }
+            let message = entry
+                .message
+                .clone()
+                .unwrap_or_else(|| "locked by another process".to_string());
+            return Err(LockError { message });
+        }
+        Ok(())
+    }
+
+    fn load_state(&self) -> anyhow::Result<LocksStateFs> {
+        match fs::read(&self.file) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(LocksStateFs::default()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if segments.is_empty() {
+                    segments.push("..".to_string());
+                } else {
+                    segments.pop();
+                }
+            }
+            std::path::Component::Normal(part) => {
+                segments.push(part.to_string_lossy().replace('\\', "/"));
+            }
+            std::path::Component::RootDir => {}
+            std::path::Component::Prefix(prefix) => {
+                segments.push(prefix.as_os_str().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    if segments.is_empty() {
+        ".".to_string()
+    } else {
+        segments.join("/")
     }
 }
 
@@ -244,6 +386,10 @@ impl Filesystem for LitFilesystem {
                 return;
             }
         };
+        if let Err(code) = self.ensure_can_mutate(req, &path, "write") {
+            reply.error(code);
+            return;
+        }
         info!(
             "write pid={} bytes={} path={}",
             req.pid(),
@@ -269,7 +415,7 @@ impl Filesystem for LitFilesystem {
 
     fn mkdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         _mode: u32,
@@ -277,22 +423,28 @@ impl Filesystem for LitFilesystem {
         reply: ReplyEntry,
     ) {
         match self.path_from_parent(parent, name) {
-            Ok(path) => match fs::create_dir(&path) {
-                Ok(_) => {
-                    let meta = fs::metadata(&path).unwrap();
-                    let mut map = self.inode_map.lock().unwrap();
-                    let ino = map.get_or_insert(&path);
-                    reply.entry(&TTL, &Self::file_attr(ino, meta), 0);
+            Ok(path) => {
+                if let Err(code) = self.ensure_can_mutate(req, &path, "mkdir") {
+                    reply.error(code);
+                    return;
                 }
-                Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
-            },
+                match fs::create_dir(&path) {
+                    Ok(_) => {
+                        let meta = fs::metadata(&path).unwrap();
+                        let mut map = self.inode_map.lock().unwrap();
+                        let ino = map.get_or_insert(&path);
+                        reply.entry(&TTL, &Self::file_attr(ino, meta), 0);
+                    }
+                    Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
+                }
+            }
             Err(_) => reply.error(ENOSYS),
         }
     }
 
     fn create(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         _mode: u32,
@@ -301,25 +453,37 @@ impl Filesystem for LitFilesystem {
         reply: ReplyCreate,
     ) {
         match self.path_from_parent(parent, name) {
-            Ok(path) => match File::create(&path) {
-                Ok(_) => {
-                    let meta = fs::metadata(&path).unwrap();
-                    let mut map = self.inode_map.lock().unwrap();
-                    let ino = map.get_or_insert(&path);
-                    reply.created(&TTL, &Self::file_attr(ino, meta), 0, ino, 0);
+            Ok(path) => {
+                if let Err(code) = self.ensure_can_mutate(req, &path, "create") {
+                    reply.error(code);
+                    return;
                 }
-                Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
-            },
+                match File::create(&path) {
+                    Ok(_) => {
+                        let meta = fs::metadata(&path).unwrap();
+                        let mut map = self.inode_map.lock().unwrap();
+                        let ino = map.get_or_insert(&path);
+                        reply.created(&TTL, &Self::file_attr(ino, meta), 0, ino, 0);
+                    }
+                    Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
+                }
+            }
             Err(_) => reply.error(ENOSYS),
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match self.path_from_parent(parent, name) {
-            Ok(path) => match fs::remove_file(&path) {
-                Ok(_) => reply.ok(),
-                Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
-            },
+            Ok(path) => {
+                if let Err(code) = self.ensure_can_mutate(req, &path, "unlink") {
+                    reply.error(code);
+                    return;
+                }
+                match fs::remove_file(&path) {
+                    Ok(_) => reply.ok(),
+                    Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
+                }
+            }
             Err(_) => reply.error(ENOSYS),
         }
     }
@@ -339,7 +503,8 @@ fn main() -> Result<()> {
         mount = %args.mountpoint.display(),
         "starting lit-fs"
     );
-    let fs = LitFilesystem::new(args.source.canonicalize()?);
+    let source = args.source.canonicalize()?;
+    let fs = LitFilesystem::new(source, args.locks_file.clone());
     let options = vec![MountOption::FSName("lit".into()), MountOption::RW];
     fuser::mount2(fs, &args.mountpoint, &options).context("mount failed")?;
     Ok(())

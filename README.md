@@ -34,6 +34,8 @@ source ~/.bashrc
 | `lit drop <path...>` | 指定ファイル/ディレクトリとその履歴を完全削除 |
 | `lit tag <name> [message]` | 現在の状態をタグとしてスナップショット化 |
 | `lit reset <name>` | 指定タグの状態にワークスペースを巻き戻す |
+| `lit tag` | 作成済みタグを時刻/タグ名/メッセージで一覧表示 |
+| `lit lock <path> [--timeout SEC] [-m MSG]` | 指定パスをロックし、他UID/PIDからの変更を拒否 |
 | `lit log [path]` | watch対象（または指定パス）の現在差分をpagerで表示 |
 | `lit sync --remote <url>` | gRPCリレーとCRDTログ/スナップショット同期 |
 | `lit blob-fetch --path <p> --version <id>` | バージョン化blobを取得 |
