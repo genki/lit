@@ -9,18 +9,30 @@ litはFUSE互換のユーザ空間ファイルシステムとして振る舞い�
 
 | サブコマンド | 主用途 | 主要オプション | 備考 |
 | --- | --- | --- | --- |
-| `lit mount <dir>` | 指定ディレクトリにlit FSをマウント | `--readonly`, `--pass-through=<glob>` | マウント成功時にデーモンPIDとソケットパスを表示 |
-| `lit unmount <dir>` | マウント解除 | `--force` | 事前に保留中ログをフラッシュ |
-| `lit status` | 現在のマウント/未同期操作を確認 | `--json`, `--verbose` | 内部操作キューやCRDTレプリカのヘルス情報を表示 |
-| `lit log` | ユーザー向け編集ブロック履歴を閲覧 | `--file <path>`, `--since <ts>`, `--op <id>` | テキストは差分、blobはバージョンIDを表示 |
-| `lit checkout <selector>` | 任意時点へロールバック/フォワード | `--timestamp`, `--op-id`, `--snapshot` | ロールバック前に現在の内部操作を一時退避 |
-| `lit snapshot create` | 即時スナップショット生成 | `--scope <path>`, `--tag <name>` | Snapshot Managerに明示指示 |
-| `lit sync` | ピアとログ/スナップショットを同期 | `--remote <url>`, `--push`, `--pull` | CRDTエンジンを介して双方向マージ |
-| `lit blob fetch <path> <version>` | blobの特定バージョン取得 | `--output <file>` | バージョンIDは`lit log`で確認 |
-| `lit label <name>` | 任意の編集ブロック範囲にラベルを付ける | `--from <op-id>`, `--to <op-id>`, `--note <text>` | すべての変更は自動記録されるため「コミット」概念は持たず、ラベルのみで人間向け区切りを与える |
-| `lit diff [<selector>]` | 任意2バージョンの差分を表示 | `--from`, `--to`, `--blob` | blobはハッシュ比較のみ |
+| `lit on [dir]` | ディレクトリをlit管理下に移行し`lit-fs`をマウント | なし | `dir`省略時はCWD。`lower/upper/work`を`~/.lit/workspaces/<id>/`配下に作成 |
+| `lit off [dir]` | FUSEマウントを解除し最新内容をターゲットに戻す | なし | アンマウント後は通常ディレクトリとして扱える |
+| `lit` | 現在のステータスを表示 | なし | ON/OFF、workspace ID、watch listを表示 |
+| `lit add <path...>` / `lit rm <path...>` | watch listへ追加/削除 | なし | `watch.json`に追跡対象を記録し、`lit log`の対象を制御 |
+| `lit drop <path...>` | ファイルと履歴(CRDT/スナップショット)を完全削除 | なし | `lower/upper/mountpoint`から対象を除去 |
+| `lit log [path]` | watch対象の差分を`diff -u`形式で表示 | `path`を指定すると単一エントリ | 表示時にAutomergeドキュメントへ反映 |
+| `lit tag [name] [message]` | `name`指定時はスナップショット作成、未指定時はタグ一覧 | なし | タグは`tags/<name>/tree`にフルコピー、`meta.json`にメッセージ保存 |
+| `lit reset <name>` | 指定タグの状態へロールバック | なし | `upper/lower`をタグのツリーで置き換える |
+| `lit lock [path] [--timeout SEC] [-m MSG]` | ロック取得（省略時はロック一覧） | timeoutは秒指定 | ロック情報は`locks.json`に保存され、`lit-fs`がUID/PIDで強制 |
+| `lit unlock <path>` | 自分のUIDが保持するロックを解除 | なし | locker PIDが死亡していれば別PIDからでも解除可 |
+| `lit sync --remote <url>` | `lit-relay`と操作ログ/Blobを同期 | `--token`, `--send-file`, `--blob` | Operation/BlobをgRPC経由で送信、ACKを受信 |
+| `lit blob-fetch --path <p> --version <id>` | RelayからBlobを取得 | `--output` | `lit sync --blob`で保存したバージョンIDを利用 |
+| `lit version` | CLIビルドバージョン表示 | なし | `cargo pkg version`を出力 |
 
-- CLIは`$HOME/.lit`に設定・ソケット・キャッシュを保持し、`lit daemon`で明示起動/停止も可能にする。
+- CLIは`$HOME/.lit`配下にworkspace状態(`workspaces/<id>/`)、ロック(`locks.json`)、watch list、CRDTファイルを保存し、`lit-fs`デーモンを自動起動する。
+
+### ワークスペース管理
+- `lit on`は対象ディレクトリの内容を`lower`に退避し、作業コピーを`upper`に複製した上で`lit-fs`(libfuseベースのRustデーモン)を`mountpoint`へアタッチする。`lit-fs`はPID/UIDを取得できるため、操作ログやロック強制に利用できる。
+- `lit off`は`fusermount3 -u`でアンマウントし、`upper`の内容をターゲットへ戻す。`lower`はベースラインとして保持され、次回`lit log`で差分を計算する際の参照になる。
+- `watch.json`には`lit add/rm`で管理対象とするパスを記録する。`lit log`はwatch listに含まれるファイルのみを対象に`diff`を生成し、Automergeベースの`lit-crdt`ドキュメントに反映する。
+
+### タグとロック
+- タグは`~/.lit/workspaces/<id>/tags/<name>/tree`にワークスペース全体を複製し、`meta.json`に作成時刻とメッセージを保存する。`lit tag`を引数なしで呼ぶと作成済みタグを時系列で出力し、`lit reset <name>`で任意タグへ復元できる。
+- ロック情報は`locks.json`に配列で保存され、各エントリに`path`, `owner_uid`, `owner_pid`, `message`, `expires_at`を持つ。`lit lock <path>`は同一UIDであれば既存PIDの死活をチェックして再取得でき、`lit unlock <path>`は元PIDが生存していない場合に別PIDからも解除できる。`lit-fs`は書き込み系操作(write/mkdir/create/unlink)の前に`locks.json`を読み込み、UID/PIDが一致しない操作をEACCESで拒否しつつメッセージをstderrへ出力する。
 
 ## リレー(gRPC)API仕様
 - `lit relay`はRust製gRPCサーバで、TLS(mTLS推奨)上にBearerトークン認証(JWT/PAT)を重ねる。CLIは`~/.lit/credentials`に保存したAPIトークンを使用する。
@@ -73,7 +85,7 @@ service RelayService {
 
 ## システム要件
 - **FUSE互換実装**: ユーザ空間で動作し、POSIXファイル操作(オープン/クローズ/リード/ライト/renameなど)やメタデータ操作(chmod/chown/utimens、ディレクトリ作成/削除、シンボリックリンク/ハードリンク、拡張属性)を余さずフックしてイベントを取得する。
-- **マウントターゲット**: 任意の既存ディレクトリに`lit mount <path>`のような形でマウントし、アンマウント時もデータを失わない。
+- **マウントターゲット**: 任意の既存ディレクトリで`lit on <path>`を実行すると、内容を`~/.lit/workspaces/<id>/lower/upper`へ退避し、`lit-fs`がFUSEマウントを提供する。アンマウント時(`lit off`)もデータを失わない。
 - **履歴記録**: 監視下ファイルに対するすべての編集操作をイベントログに記録。ログにはタイムスタンプ、操作種別、呼び出しコンテキスト(UID/PID)、対象パス、メタデータ差分を含め、任意の時点(ブロックIDやメタデータのロジカルクロック)に再生して状態復元できる。
 - **データ分類**: 管理対象ファイルをテキスト(文字列CRDTで内容を追跡)とblob(バイナリ/大容量)に二分し、blobは内容差分を取らずバージョン単位で保管する。拡張子や MIME で自動判別し、手動オーバーライドも可能とする。
 - **履歴記録**: 監視下ファイルに対するすべての編集操作をイベントログに記録。ログにはタイムスタンプ、操作種別、呼び出しコンテキスト(UID/PID)、対象パス、メタデータ差分を含め、任意の時点(ブロックIDやメタデータのロジカルクロック)に再生して状態復元できる。
@@ -91,9 +103,9 @@ service RelayService {
 
 ## 主要フロー
 ### マウント
-1. `lit mount /path/to/workdir` を実行。
-2. Filesystem AdapterがFUSE経由でマウントポイントを作成。
-3. 対象ディレクトリ構造を初期スナップショットとして取り込み、操作ログの起点(ロジカルクロック0)を作る。
+1. `lit on /path/to/workdir` を実行。
+2. CLIが対象ディレクトリ配下のファイルを`lower`に移動し、`lower`をコピーした`upper`を作成する。`lit-fs`が`upper`をバックエンドとしてFUSEマウントする。
+3. `watch.json`や`locks.json`などworkspaceメタデータを初期化し、初回スナップショット(ロジカルクロック0)を作成する。
 
 ### 編集追跡
 1. ユーザがファイルを編集すると、システムコールがAdapterに渡る。
