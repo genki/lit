@@ -6,7 +6,7 @@ use fuser::{
 };
 use libc::{EACCES, ENOENT, ENOSYS};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,6 +27,8 @@ struct Args {
     mountpoint: PathBuf,
     #[arg(long)]
     locks_file: Option<PathBuf>,
+    #[arg(long)]
+    dirty_flag: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -69,6 +71,8 @@ struct LitFilesystem {
     inode_map: Mutex<InodeMap>,
     root: PathBuf,
     lock_manager: Option<LockManager>,
+    dirty_inodes: Mutex<HashSet<u64>>,
+    dirty_flag: Option<PathBuf>,
 }
 
 struct LockManager {
@@ -96,13 +100,15 @@ struct LockError {
 }
 
 impl LitFilesystem {
-    fn new(root: PathBuf, locks_file: Option<PathBuf>) -> Self {
+    fn new(root: PathBuf, locks_file: Option<PathBuf>, dirty_flag: Option<PathBuf>) -> Self {
         let inode_map = Mutex::new(InodeMap::new(root.clone()));
         let lock_manager = locks_file.map(LockManager::new);
         Self {
             inode_map,
             root,
             lock_manager,
+            dirty_inodes: Mutex::new(HashSet::new()),
+            dirty_flag,
         }
     }
 
@@ -169,6 +175,45 @@ impl LitFilesystem {
             }
         }
         Ok(())
+    }
+
+    fn mark_dirty(&self, ino: u64) {
+        let mut dirty = self.dirty_inodes.lock().unwrap();
+        dirty.insert(ino);
+    }
+
+    fn take_dirty_path(&self, ino: u64) -> Option<PathBuf> {
+        let mut dirty = self.dirty_inodes.lock().unwrap();
+        if !dirty.remove(&ino) {
+            return None;
+        }
+        drop(dirty);
+        self.inode_map.lock().unwrap().get_path(ino)
+    }
+
+    fn signal_dirty(&self, path: &Path) {
+        if let Some(flag) = &self.dirty_flag {
+            if let Some(parent) = flag.parent() {
+                if let Err(err) = fs::create_dir_all(parent) {
+                    warn!(
+                        flag = %flag.display(),
+                        "failed to create dirty flag dir: {err}"
+                    );
+                    return;
+                }
+            }
+            let rel = self
+                .path_relative_str(path)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            let payload = format!("{} {}\n", unix_timestamp(), rel);
+            if let Err(err) = fs::write(flag, payload) {
+                warn!(
+                    flag = %flag.display(),
+                    path = %rel,
+                    "failed to write dirty flag: {err}"
+                );
+            }
+        }
     }
 }
 
@@ -410,7 +455,10 @@ impl Filesystem for LitFilesystem {
             return;
         }
         match file.write(data) {
-            Ok(written) => reply.written(written as u32),
+            Ok(written) => {
+                self.mark_dirty(ino);
+                reply.written(written as u32)
+            }
             Err(_) => reply.error(ENOSYS),
         }
     }
@@ -436,6 +484,7 @@ impl Filesystem for LitFilesystem {
                         let mut map = self.inode_map.lock().unwrap();
                         let ino = map.get_or_insert(&path);
                         reply.entry(&TTL, &Self::file_attr(ino, meta), 0);
+                        self.signal_dirty(&path);
                     }
                     Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
                 }
@@ -466,6 +515,7 @@ impl Filesystem for LitFilesystem {
                         let mut map = self.inode_map.lock().unwrap();
                         let ino = map.get_or_insert(&path);
                         reply.created(&TTL, &Self::file_attr(ino, meta), 0, ino, 0);
+                        self.signal_dirty(&path);
                     }
                     Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
                 }
@@ -482,12 +532,31 @@ impl Filesystem for LitFilesystem {
                     return;
                 }
                 match fs::remove_file(&path) {
-                    Ok(_) => reply.ok(),
+                    Ok(_) => {
+                        reply.ok();
+                        self.signal_dirty(&path);
+                    }
                     Err(err) => reply.error(err.raw_os_error().unwrap_or(ENOSYS)),
                 }
             }
             Err(_) => reply.error(ENOSYS),
         }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(path) = self.take_dirty_path(ino) {
+            self.signal_dirty(&path);
+        }
+        reply.ok();
     }
 }
 
@@ -506,7 +575,7 @@ fn main() -> Result<()> {
         "starting lit-fs"
     );
     let source = args.source.canonicalize()?;
-    let fs = LitFilesystem::new(source, args.locks_file.clone());
+    let fs = LitFilesystem::new(source, args.locks_file.clone(), args.dirty_flag.clone());
     let options = vec![MountOption::FSName("lit".into()), MountOption::RW];
     fuser::mount2(fs, &args.mountpoint, &options).context("mount failed")?;
     Ok(())

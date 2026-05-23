@@ -18,6 +18,7 @@ pub fn write_state(root: &Path, state: &MountState) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn read_state(root: &Path) -> Result<MountState> {
     let path = root.join(STATE_FILE);
     if !path.exists() {

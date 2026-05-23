@@ -1,329 +1,369 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Context;
-use async_stream::try_stream;
+use chrono::Utc;
 use clap::Parser;
+use dashmap::DashMap;
 use futures::Stream;
-use futures::StreamExt;
-use lit_storage::{FsBackend, StorageBackend, StorageConfig, StorageError};
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use prost::Message;
-use tokio::sync::RwLock;
-use tonic::{service::Interceptor, transport::Server, Request, Response, Status};
-use tracing::info;
-use uuid::Uuid;
-
-const PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.');
-
-use proto::relay_service_server::{RelayService, RelayServiceServer};
-use proto::{
-    operation_envelope::Payload, Ack, BlobRef, FetchBlobRequest, FetchBlobResponse,
-    FetchSnapshotRequest, HeartbeatRequest, HeartbeatResponse, Label, LabelRef, ListRefsRequest,
-    ListRefsResponse, OpenSessionRequest, OpenSessionResponse, OperationEnvelope, SnapshotChunk,
-    SnapshotMeta,
-};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{transport::Server, Request, Response, Status};
+use tracing::{error, info, warn};
 
 mod proto {
     tonic::include_proto!("lit.relay.v1");
 }
 
+use proto::relay_service_server::{RelayService, RelayServiceServer};
+use proto::{
+    FetchSnapshotRequest, FetchSnapshotResponse, ListWorkspacesRequest, ListWorkspacesResponse,
+    PublishSnapshotRequest, PublishSnapshotResponse, SnapshotEnvelope, SubscribeSnapshotsRequest,
+    WorkspaceInfo,
+};
+
 #[derive(Parser, Debug)]
-#[command(name = "lit-relay", about = "Relay server for lit gRPC sync")]
+#[command(name = "lit-relay", about = "State-based snapshot relay for lit")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:50051")]
     listen: String,
     #[arg(long, default_value = "./.lit-relay")]
     storage_root: PathBuf,
-    #[arg(long, default_value = "fs", value_parser = ["fs", "mem"])]
-    backend: String,
-    #[arg(long)]
-    auth_token: Option<String>,
 }
 
-#[derive(Default)]
-struct SessionState {
-    node_id: String,
-    last_op: u64,
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct WorkspaceMeta {
+    latest_version: u64,
+    updated_at: i64,
+    hash: String,
+    size_bytes: u64,
 }
 
 #[derive(Clone)]
-struct LitRelay {
-    storage: Arc<dyn StorageBackend>,
-    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+struct SnapshotStore {
+    root: Arc<PathBuf>,
 }
 
-impl LitRelay {
-    fn new(storage: Arc<dyn StorageBackend>) -> Self {
-        Self {
-            storage,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-        }
+impl SnapshotStore {
+    fn new(root: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(root.join("workspaces"))?;
+        Ok(Self {
+            root: Arc::new(root),
+        })
     }
 
-    async fn persist_payload(
-        &self,
-        session_id: &str,
-        seq: u64,
-        payload: &Payload,
-    ) -> Result<(), Status> {
-        match payload {
-            Payload::Operation(op) => {
-                let mut buf = Vec::new();
-                op.encode(&mut buf)
-                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
-                let key = format!("logs/{session_id}/{seq:020}.bin");
-                self.storage
-                    .put_object(&key, &buf)
-                    .await
-                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
-                if op.is_blob {
-                    let version_id = format!("{seq:020}");
-                    self.store_blob(&op.file_path, &version_id, &op.payload)
-                        .await?;
-                }
-            }
-            Payload::Snapshot(snapshot) => {
-                let mut buf = Vec::new();
-                snapshot
-                    .encode(&mut buf)
-                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
-                let key = format!("snaps/meta/{}.bin", snapshot.snapshot_id);
-                self.storage
-                    .put_object(&key, &buf)
-                    .await
-                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
-                let data_key = format!("snaps/data/{}.bin", snapshot.snapshot_id);
-                if let Err(StorageError::NotFound(_)) = self.storage.get_object(&data_key).await {
-                    self.storage
-                        .put_object(&data_key, &[])
-                        .await
-                        .map_err(|e| Status::internal(format!("store failure: {e}")))?;
-                }
-            }
-            Payload::Label(label) => {
-                let mut buf = Vec::new();
-                label
-                    .encode(&mut buf)
-                    .map_err(|e| Status::internal(format!("encode failure: {e}")))?;
-                let key = format!("labels/{}.bin", label.label_id);
-                self.storage
-                    .put_object(&key, &buf)
-                    .await
-                    .map_err(|e| Status::internal(format!("store failure: {e}")))?;
-            }
+    fn workspace_dir(&self, slug: &str) -> PathBuf {
+        self.root.join("workspaces").join(slug)
+    }
+
+    fn metadata_path(dir: &Path) -> PathBuf {
+        dir.join("metadata.json")
+    }
+
+    fn snapshot_path(dir: &Path, version: u64) -> PathBuf {
+        dir.join(format!("snapshot-{version:020}.json"))
+    }
+
+    fn load_meta(&self, dir: &Path) -> anyhow::Result<WorkspaceMeta> {
+        let path = Self::metadata_path(dir);
+        if !path.exists() {
+            return Ok(WorkspaceMeta::default());
+        }
+        let bytes = fs::read(path)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn save_meta(&self, dir: &Path, meta: &WorkspaceMeta) -> anyhow::Result<()> {
+        let path = Self::metadata_path(dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_vec_pretty(meta)?)?;
+        Ok(())
+    }
+
+    fn ensure_slug(slug: &str) -> Result<(), Status> {
+        if slug.is_empty() {
+            return Err(Status::invalid_argument("workspace slug is required"));
+        }
+        if slug.len() > 128 {
+            return Err(Status::invalid_argument("workspace slug too long"));
+        }
+        if !slug
+            .chars()
+            .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_'))
+        {
+            return Err(Status::invalid_argument(
+                "workspace slug must be [-a-z0-9_-]",
+            ));
         }
         Ok(())
     }
 
-    async fn store_blob(&self, path: &str, version_id: &str, data: &[u8]) -> Result<(), Status> {
-        let key = format!("blobs/{}/{}", encode_blob_path(path), version_id);
-        self.storage
-            .put_object(&key, data)
-            .await
-            .map_err(|e| Status::internal(format!("store failure: {e}")))
+    fn publish_snapshot(
+        &self,
+        req: PublishSnapshotRequest,
+    ) -> Result<PublishSnapshotResponse, Status> {
+        Self::ensure_slug(&req.workspace)?;
+        if req.snapshot_json.is_empty() {
+            return Err(Status::invalid_argument("snapshot_json must not be empty"));
+        }
+        let dir = self.workspace_dir(&req.workspace);
+        fs::create_dir_all(&dir)
+            .map_err(|e| Status::internal(format!("failed to create workspace dir: {e}")))?;
+        let mut meta = self
+            .load_meta(&dir)
+            .map_err(|e| Status::internal(format!("failed to read metadata: {e}")))?;
+        let new_version = meta.latest_version.saturating_add(1);
+        let snapshot_path = Self::snapshot_path(&dir, new_version);
+        fs::write(&snapshot_path, &req.snapshot_json)
+            .map_err(|e| Status::internal(format!("failed to store snapshot: {e}")))?;
+        meta.latest_version = new_version;
+        meta.updated_at = Utc::now().timestamp();
+        meta.hash = req.hash;
+        meta.size_bytes = req.size_bytes;
+        self.save_meta(&dir, &meta)
+            .map_err(|e| Status::internal(format!("failed to write metadata: {e}")))?;
+        Ok(PublishSnapshotResponse {
+            workspace: req.workspace,
+            stored_version: new_version,
+        })
+    }
+
+    fn fetch_snapshot(&self, workspace: &str) -> Result<FetchSnapshotResponse, Status> {
+        Self::ensure_slug(workspace)?;
+        let dir = self.workspace_dir(workspace);
+        let meta = self
+            .load_meta(&dir)
+            .map_err(|e| Status::internal(format!("failed to read metadata: {e}")))?;
+        if meta.latest_version == 0 {
+            return Err(Status::not_found("workspace has no snapshots"));
+        }
+        let path = Self::snapshot_path(&dir, meta.latest_version);
+        let data = fs::read(&path)
+            .map_err(|e| Status::internal(format!("failed to read snapshot: {e}")))?;
+        Ok(FetchSnapshotResponse {
+            workspace: workspace.to_string(),
+            snapshot_json: data,
+            size_bytes: meta.size_bytes,
+            hash: meta.hash,
+            stored_version: meta.latest_version,
+        })
+    }
+
+    fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceInfo>> {
+        let mut entries = Vec::new();
+        let dir = self.root.join("workspaces");
+        if !dir.exists() {
+            return Ok(entries);
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if Self::ensure_slug(name).is_err() {
+                    continue;
+                }
+                let meta = self.load_meta(&entry.path()).unwrap_or_default();
+                entries.push(WorkspaceInfo {
+                    workspace: name.to_string(),
+                    latest_version: meta.latest_version,
+                    updated_at: meta.updated_at as u64,
+                });
+            }
+        }
+        Ok(entries)
     }
 }
 
-type ResponseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Ack, Status>> + Send + 'static>>;
-type ResponseStreamSnapshots =
-    std::pin::Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send + 'static>>;
+#[derive(Clone)]
+struct SnapshotBroadcaster {
+    channels: Arc<DashMap<String, broadcast::Sender<Arc<SnapshotEnvelope>>>>,
+}
 
-#[tonic::async_trait]
-impl RelayService for LitRelay {
-    type StreamOpsStream = ResponseStream;
-    type FetchSnapshotStream = ResponseStreamSnapshots;
-
-    async fn open_session(
-        &self,
-        request: Request<OpenSessionRequest>,
-    ) -> Result<Response<OpenSessionResponse>, Status> {
-        let req = request.into_inner();
-        let session_id = Uuid::new_v4().to_string();
-        let vector = req.local_vector.clone().unwrap_or_default();
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(
-            session_id.clone(),
-            SessionState {
-                node_id: req.node_id.clone(),
-                last_op: 0,
-            },
-        );
-        let response = OpenSessionResponse {
-            session_id,
-            relay_vector: Some(vector),
-            missing_log_ranges: vec![],
-        };
-        Ok(Response::new(response))
+impl SnapshotBroadcaster {
+    fn new() -> Self {
+        Self {
+            channels: Arc::new(DashMap::new()),
+        }
     }
 
-    async fn stream_ops(
+    fn subscribe(&self, workspace: &str) -> broadcast::Receiver<Arc<SnapshotEnvelope>> {
+        self.sender(workspace).subscribe()
+    }
+
+    fn notify(&self, envelope: SnapshotEnvelope) {
+        let workspace = envelope.workspace.clone();
+        let sender = self.sender(&workspace);
+        if sender.send(Arc::new(envelope)).is_err() {
+            // No active subscribers; drop silently.
+        }
+    }
+
+    fn sender(&self, workspace: &str) -> broadcast::Sender<Arc<SnapshotEnvelope>> {
+        if let Some(sender) = self.channels.get(workspace) {
+            return sender.value().clone();
+        }
+        let (sender, _) = broadcast::channel(32);
+        self.channels.insert(workspace.to_string(), sender.clone());
+        sender
+    }
+}
+
+impl From<FetchSnapshotResponse> for SnapshotEnvelope {
+    fn from(resp: FetchSnapshotResponse) -> Self {
+        SnapshotEnvelope {
+            workspace: resp.workspace,
+            version: resp.stored_version,
+            snapshot_json: resp.snapshot_json,
+            size_bytes: resp.size_bytes,
+            hash: resp.hash,
+            published_at: Utc::now().timestamp() as u64,
+        }
+    }
+}
+
+fn broadcast_latest(
+    store: &Arc<SnapshotStore>,
+    broadcaster: &SnapshotBroadcaster,
+    workspace: &str,
+) {
+    match store.fetch_snapshot(workspace) {
+        Ok(resp) => broadcaster.notify(resp.into()),
+        Err(err) => warn!(workspace = %workspace, "failed to fetch snapshot for broadcast: {err}"),
+    }
+}
+
+#[derive(Clone)]
+struct RelayServiceImpl {
+    store: Arc<SnapshotStore>,
+    broadcaster: SnapshotBroadcaster,
+}
+
+#[tonic::async_trait]
+impl RelayService for RelayServiceImpl {
+    type PublishSnapshotStreamStream =
+        Pin<Box<dyn Stream<Item = Result<PublishSnapshotResponse, Status>> + Send + 'static>>;
+    type SubscribeSnapshotsStream =
+        Pin<Box<dyn Stream<Item = Result<SnapshotEnvelope, Status>> + Send + 'static>>;
+
+    async fn publish_snapshot(
         &self,
-        request: Request<tonic::Streaming<OperationEnvelope>>,
-    ) -> Result<Response<Self::StreamOpsStream>, Status> {
-        let mut stream = request.into_inner();
-        let relay = self.clone();
-        let sessions = relay.sessions.clone();
-        let output = try_stream! {
-            while let Some(item) = stream.next().await {
-                let envelope = item?;
-                let session_id = if envelope.session_id.is_empty() {
-                    Err(Status::invalid_argument("session_id is required"))?
-                } else {
-                    envelope.session_id.clone()
-                };
-                let seq = {
-                    let mut guard = sessions.write().await;
-                    let state = guard
-                        .get_mut(&session_id)
-                        .ok_or_else(|| Status::not_found("unknown session"))?;
-                    state.last_op += 1;
-                    state.last_op
-                };
-                let payload = envelope
-                    .payload
-                    .as_ref()
-                    .ok_or_else(|| Status::invalid_argument("payload missing"))?;
-                relay.persist_payload(&session_id, seq, payload).await?;
-                yield Ack {
-                    session_id: session_id.clone(),
-                    last_applied_op: seq,
-                    error: String::new(),
-                };
-            }
-        };
-        Ok(Response::new(Box::pin(output) as ResponseStream))
+        request: Request<PublishSnapshotRequest>,
+    ) -> Result<Response<PublishSnapshotResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self.store.publish_snapshot(req)?;
+        let workspace = resp.workspace.clone();
+        broadcast_latest(&self.store, &self.broadcaster, &workspace);
+        Ok(Response::new(resp))
     }
 
     async fn fetch_snapshot(
         &self,
         request: Request<FetchSnapshotRequest>,
-    ) -> Result<Response<Self::FetchSnapshotStream>, Status> {
+    ) -> Result<Response<FetchSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let snapshot_id = req.snapshot_id;
-        if snapshot_id.is_empty() {
-            return Err(Status::invalid_argument("snapshot_id is required"));
-        }
-        let key = format!("snaps/data/{snapshot_id}.bin");
-        match self.storage.get_object(&key).await {
-            Ok(bytes) => {
-                let chunk_size = 1024 * 1024;
-                let total = std::cmp::max(1, (bytes.len() + chunk_size - 1) / chunk_size);
-                let snapshot_id_clone = snapshot_id.clone();
-                let chunks = bytes
-                    .chunks(chunk_size)
-                    .enumerate()
-                    .map(move |(index, data)| SnapshotChunk {
-                        snapshot_id: snapshot_id_clone.clone(),
-                        data: data.to_vec(),
-                        index: index as u32,
-                        total: total as u32,
-                    })
-                    .collect::<Vec<_>>();
-                let stream = tokio_stream::iter(chunks.into_iter().map(Ok));
-                Ok(Response::new(Box::pin(stream) as ResponseStreamSnapshots))
-            }
-            Err(StorageError::NotFound(_)) => Err(Status::not_found("snapshot not found")),
-            Err(err) => Err(Status::internal(format!("{err}"))),
-        }
+        let resp = self.store.fetch_snapshot(&req.workspace)?;
+        Ok(Response::new(resp))
     }
 
-    async fn fetch_blob(
+    async fn list_workspaces(
         &self,
-        request: Request<FetchBlobRequest>,
-    ) -> Result<Response<FetchBlobResponse>, Status> {
+        _request: Request<ListWorkspacesRequest>,
+    ) -> Result<Response<ListWorkspacesResponse>, Status> {
+        let workspaces = self
+            .store
+            .list_workspaces()
+            .map_err(|e| Status::internal(format!("failed to list workspaces: {e}")))?;
+        Ok(Response::new(ListWorkspacesResponse { workspaces }))
+    }
+
+    async fn publish_snapshot_stream(
+        &self,
+        request: Request<tonic::Streaming<PublishSnapshotRequest>>,
+    ) -> Result<Response<Self::PublishSnapshotStreamStream>, Status> {
+        let mut inbound = request.into_inner();
+        let store = self.store.clone();
+        let broadcaster = self.broadcaster.clone();
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            loop {
+                let req = match inbound.message().await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => break,
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                };
+                let workspace = req.workspace.clone();
+                match store.publish_snapshot(req) {
+                    Ok(resp) => {
+                        if tx.send(Ok(resp.clone())).await.is_err() {
+                            break;
+                        }
+                        broadcast_latest(&store, &broadcaster, &workspace);
+                    }
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::PublishSnapshotStreamStream
+        ))
+    }
+
+    async fn subscribe_snapshots(
+        &self,
+        request: Request<SubscribeSnapshotsRequest>,
+    ) -> Result<Response<Self::SubscribeSnapshotsStream>, Status> {
         let req = request.into_inner();
-        if req.path.is_empty() || req.version_id.is_empty() {
-            return Err(Status::invalid_argument("path and version_id are required"));
-        }
-        let key = format!("blobs/{}/{}", encode_blob_path(&req.path), req.version_id);
-        match self.storage.get_object(&key).await {
-            Ok(data) => Ok(Response::new(FetchBlobResponse { data })),
-            Err(StorageError::NotFound(_)) => Err(Status::not_found("blob not found")),
-            Err(err) => Err(Status::internal(format!("{err}"))),
-        }
-    }
-
-    async fn list_refs(
-        &self,
-        _request: Request<ListRefsRequest>,
-    ) -> Result<Response<ListRefsResponse>, Status> {
-        let mut label_refs = Vec::new();
-        for key in self
-            .storage
-            .list_objects("labels")
-            .await
-            .map_err(|e| Status::internal(format!("{e}")))?
-        {
-            let bytes = self
-                .storage
-                .get_object(&key)
-                .await
-                .map_err(|e| Status::internal(format!("{e}")))?;
-            let label = Label::decode(&*bytes)
-                .map_err(|e| Status::internal(format!("decode failure: {e}")))?;
-            label_refs.push(LabelRef {
-                label_id: label.label_id,
-                name: label.name,
-                to_op: label.to_op,
-            });
-        }
-
-        let mut snapshot_ids = Vec::new();
-        for key in self
-            .storage
-            .list_objects("snaps/meta")
-            .await
-            .map_err(|e| Status::internal(format!("{e}")))?
-        {
-            let bytes = self
-                .storage
-                .get_object(&key)
-                .await
-                .map_err(|e| Status::internal(format!("{e}")))?;
-            let meta = SnapshotMeta::decode(&*bytes)
-                .map_err(|e| Status::internal(format!("decode failure: {e}")))?;
-            snapshot_ids.push(meta.snapshot_id);
-        }
-
-        let mut blob_refs = Vec::new();
-        for key in self
-            .storage
-            .list_objects("blobs")
-            .await
-            .map_err(|e| Status::internal(format!("{e}")))?
-        {
-            let parts: Vec<&str> = key.split('/').collect();
-            if parts.len() != 3 {
-                continue;
+        SnapshotStore::ensure_slug(&req.workspace)?;
+        let workspace = req.workspace.clone();
+        let store = self.store.clone();
+        let broadcaster = self.broadcaster.clone();
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut last_version = req.from_version;
+            if let Ok(resp) = store.fetch_snapshot(&workspace) {
+                if resp.stored_version > last_version {
+                    let env: SnapshotEnvelope = resp.into();
+                    last_version = env.version;
+                    if tx.send(Ok(env)).await.is_err() {
+                        return;
+                    }
+                }
             }
-            let encoded_path = parts[1];
-            if let Some(path) = decode_blob_path(encoded_path) {
-                let version_id = parts[2].to_string();
-                blob_refs.push(BlobRef { path, version_id });
+            let mut subscriber = broadcaster.subscribe(&workspace);
+            loop {
+                match subscriber.recv().await {
+                    Ok(env_arc) => {
+                        let env = (*env_arc).clone();
+                        if env.version <= last_version {
+                            continue;
+                        }
+                        last_version = env.version;
+                        if tx.send(Ok(env)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-        }
-        let response = ListRefsResponse {
-            labels: label_refs,
-            snapshots: snapshot_ids,
-            blobs: blob_refs,
-        };
-        Ok(Response::new(response))
-    }
-
-    async fn heartbeat(
-        &self,
-        request: Request<HeartbeatRequest>,
-    ) -> Result<Response<HeartbeatResponse>, Status> {
-        let session_id = request.into_inner().session_id;
-        let sessions = self.sessions.read().await;
-        let node_id = sessions
-            .get(&session_id)
-            .map(|state| state.node_id.clone())
-            .ok_or_else(|| Status::not_found("unknown session"))?;
-        Ok(Response::new(HeartbeatResponse {
-            session_id,
-            status: format!("ok:{node_id}"),
-        }))
+        });
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::SubscribeSnapshotsStream
+        ))
     }
 }
 
@@ -333,60 +373,25 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .init();
+
     let args = Args::parse();
-    let backend: Arc<dyn StorageBackend> = match args.backend.as_str() {
-        "mem" => Arc::new(lit_storage::MemBackend::default()),
-        _ => {
-            let config = StorageConfig::new(&args.storage_root);
-            Arc::new(FsBackend::new(config))
-        }
+    let store = Arc::new(SnapshotStore::new(args.storage_root.clone())?);
+    let service = RelayServiceImpl {
+        store: store.clone(),
+        broadcaster: SnapshotBroadcaster::new(),
     };
     let addr: SocketAddr = args
         .listen
         .parse()
         .context("failed to parse listen address")?;
-    info!(%addr, "starting lit-relay server");
-    let interceptor = AuthInterceptor {
-        token: args.auth_token.clone(),
-    };
-    let service = RelayServiceServer::with_interceptor(LitRelay::new(backend), interceptor);
-    Server::builder()
-        .add_service(service)
+    info!(%addr, "starting lit snapshot relay");
+    if let Err(err) = Server::builder()
+        .add_service(RelayServiceServer::new(service))
         .serve(addr)
         .await
-        .context("server failure")?;
+    {
+        error!("relay server stopped: {err}");
+        return Err(err.into());
+    }
     Ok(())
-}
-
-fn verify_bearer<T>(req: &Request<T>, token: &str) -> Result<(), Status> {
-    let expected = format!("Bearer {token}");
-    match req.metadata().get("authorization") {
-        Some(value) if value.to_str().map(|v| v == expected).unwrap_or(false) => Ok(()),
-        _ => Err(Status::unauthenticated("invalid or missing token")),
-    }
-}
-
-#[derive(Clone)]
-struct AuthInterceptor {
-    token: Option<String>,
-}
-
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(token) = &self.token {
-            verify_bearer(&req, token)?;
-        }
-        Ok(req)
-    }
-}
-
-fn encode_blob_path(path: &str) -> String {
-    utf8_percent_encode(path, PATH_ENCODE_SET).to_string()
-}
-
-fn decode_blob_path(encoded: &str) -> Option<String> {
-    percent_decode_str(encoded)
-        .decode_utf8()
-        .ok()
-        .map(|cow| cow.into_owned())
 }

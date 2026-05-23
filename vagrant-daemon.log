@@ -1,0 +1,8 @@
+[2m2025-11-18T00:54:39.716711Z[0m [32m INFO[0m publish stream acknowledged snapshot [3mworkspace[0m[2m=[0mmba22-sync [3mversion[0m[2m=[0m1
+[2m2025-11-18T00:54:39.724459Z[0m [33m WARN[0m failed to apply remote snapshot: failed to write "/home/vagrant/lit/tmp/mba22-sync/notes.txt" [3mworkspace[0m[2m=[0mmba22-sync [3mversion[0m[2m=[0m1
+[2m2025-11-18T00:54:39.731253Z[0m [32m INFO[0m publish stream acknowledged snapshot [3mworkspace[0m[2m=[0mtest [3mversion[0m[2m=[0m1
+[2m2025-11-18T00:54:39.732062Z[0m [33m WARN[0m failed to apply remote snapshot: failed to write "/home/vagrant/lit/tmp/test/vagrant-sync-20251117.txt" [3mworkspace[0m[2m=[0mtest [3mversion[0m[2m=[0m1
+[2m2025-11-18T00:54:39.751455Z[0m [32m INFO[0m publish stream acknowledged snapshot [3mworkspace[0m[2m=[0mvm-workspace [3mversion[0m[2m=[0m1
+[2m2025-11-18T00:56:51.609775Z[0m [33m WARN[0m failed to apply remote snapshot: failed to write "/home/vagrant/lit/tmp/test/vagrant-sync-20251117.txt" [3mworkspace[0m[2m=[0mtest [3mversion[0m[2m=[0m2
+[2m2025-11-18T00:56:51.611793Z[0m [33m WARN[0m failed to apply remote snapshot: failed to write "/home/vagrant/lit/tmp/mba22-sync/notes.txt" [3mworkspace[0m[2m=[0mmba22-sync [3mversion[0m[2m=[0m2
+[2m2025-11-18T00:56:51.613401Z[0m [32m INFO[0m applied remote snapshot [3mworkspace[0m[2m=[0mvm-workspace [3mversion[0m[2m=[0m2 [3mbytes[0m[2m=[0m39

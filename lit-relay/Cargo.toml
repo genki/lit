@@ -8,20 +8,19 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1"
-async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
-futures = "0.3"
-lit-storage = { path = "../lit-storage" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 prost = "0.13"
 prost-types = "0.13"
-thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic = { version = "0.12", features = ["transport"] }
-tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
-percent-encoding = "2"
+dashmap = "5"
+tokio-stream = "0.1"
+futures = "0.3"
 
 [build-dependencies]
 tonic-build = "0.12"

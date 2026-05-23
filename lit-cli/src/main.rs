@@ -1,37 +1,48 @@
 use anyhow::{anyhow, Context};
-use chrono::{Local, LocalResult, TimeZone};
+use chrono::{Local, LocalResult, TimeZone, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use dirs::home_dir;
 use hex::ToHex;
 use libc;
 use lit_crdt::TextCrdt;
-use mime_guess::MimeGuess;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write as IoWrite};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::Request;
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use proto::operation_envelope::Payload;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+
 use proto::relay_service_client::RelayServiceClient;
 use proto::{
-    FetchBlobRequest, HeartbeatRequest, ListRefsRequest, OpenSessionRequest, Operation,
-    OperationEnvelope,
+    FetchSnapshotRequest, ListWorkspacesRequest, PublishSnapshotRequest, SnapshotEnvelope,
+    SubscribeSnapshotsRequest,
+};
+use state_sync::{
+    apply_incoming_snapshots, apply_snapshot, archive_remote_snapshot, build_snapshot,
+    latest_remote_version, persist_local_snapshot, WorkspaceSnapshot,
 };
 
 mod proto {
@@ -39,8 +50,11 @@ mod proto {
 }
 
 mod mount;
+mod state_sync;
 
 const DEFAULT_RELAY_ADDR: &str = "127.0.0.1:5151";
+const DIRTY_POLL_INTERVAL_MS: u64 = 500;
+const DIRTY_COALESCE_SECS: u64 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,8 +72,6 @@ struct Cli {
 enum Commands {
     /// Sync with a lit relay
     Sync(SyncArgs),
-    /// Fetch a blob version
-    BlobFetch(BlobFetchArgs),
     /// Turn on lit (mount a workspace via FUSE overlay)
     On(OnArgs),
     /// Turn off lit (unmount a workspace)
@@ -84,8 +96,10 @@ enum Commands {
     Log(LogArgs),
     /// Show status for specific path
     Info(InfoArgs),
-    /// List currently mounted lit workspaces
-    Ls,
+    /// List local/remote lit workspaces
+    Ls(LsArgs),
+    /// Clone a workspace from relay
+    Clone(CloneArgs),
     /// Start local relay or remote sync
     Start(StartArgs),
     /// Stop relay/sync daemons
@@ -103,45 +117,32 @@ enum Commands {
 struct SyncArgs {
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     remote: String,
-    #[arg(long)]
-    token: Option<String>,
-    #[arg(long)]
-    node_id: Option<String>,
-    #[arg(long = "send-file")]
-    file: Option<PathBuf>,
-    #[arg(long)]
-    blob: bool,
+    #[arg(long, value_name = "PATH")]
+    workspace: PathBuf,
     /// 指定すると同期を周期実行
     #[arg(long)]
     repeat: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
-struct BlobFetchArgs {
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
-    remote: String,
-    #[arg(long)]
-    token: Option<String>,
-    #[arg(long)]
-    node_id: Option<String>,
-    #[arg(long)]
-    path: String,
-    #[arg(long = "version")]
-    version_id: String,
-    #[arg(long)]
-    output: PathBuf,
-}
-
-#[derive(clap::Args, Debug)]
 struct OnArgs {
     /// Target directory to initialize (defaults to current directory)
     path: Option<PathBuf>,
+    /// Use VM config JSON to mount via remote VM instead of local FUSE
+    #[arg(long = "vm-config")]
+    vm_config: Option<PathBuf>,
+    /// Workspace slug (defaults to basename of path)
+    #[arg(long = "name")]
+    name: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
 struct OffArgs {
     /// Targetディレクトリ(省略時はカレント)
     path: Option<PathBuf>,
+    /// Use VM config JSON when unmounting remote VM workspace
+    #[arg(long = "vm-config")]
+    vm_config: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -187,6 +188,27 @@ struct InfoArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct LsArgs {
+    /// Relay URL to query for remote workspaces
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    remote: String,
+    /// Only show local workspaces (skip relay call)
+    #[arg(long)]
+    local_only: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct CloneArgs {
+    /// Workspace slug to clone from relay
+    workspace: String,
+    /// Target path (defaults to workspace slug)
+    path: Option<PathBuf>,
+    /// Relay URL to fetch from
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    remote: String,
+}
+
+#[derive(clap::Args, Debug)]
 struct StartArgs {
     /// Optional remote URL to sync with
     url: Option<String>,
@@ -216,7 +238,6 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Sync(args)) => run_sync(args).await?,
-        Some(Commands::BlobFetch(args)) => run_blob_fetch(args).await?,
         Some(Commands::On(args)) => run_on(args).await?,
         Some(Commands::Off(args)) => run_off(args).await?,
         Some(Commands::Add(args)) => run_watch_args(args, true).await?,
@@ -228,7 +249,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Drop(args)) => run_drop(args).await?,
         Some(Commands::Log(args)) => run_log(args).await?,
         Some(Commands::Info(args)) => run_info(args).await?,
-        Some(Commands::Ls) => run_ls().await?,
+        Some(Commands::Ls(args)) => run_ls(args).await?,
+        Some(Commands::Clone(args)) => run_clone(args).await?,
         Some(Commands::Start(args)) => run_start(args).await?,
         Some(Commands::Stop) => run_stop().await?,
         Some(Commands::Daemon(args)) => run_daemon(args).await?,
@@ -259,6 +281,48 @@ fn run_completions(args: CompletionArgs) -> anyhow::Result<()> {
 
 async fn run_info(args: InfoArgs) -> anyhow::Result<()> {
     run_status(Some(args.path)).await
+}
+
+async fn run_clone(args: CloneArgs) -> anyhow::Result<()> {
+    let slug = sanitize_slug(&args.workspace)?;
+    let target = args.path.clone().unwrap_or_else(|| PathBuf::from(&slug));
+    prepare_clone_target(&target)?;
+    let mut client = relay_client(&args.remote).await?;
+    let resp = client
+        .fetch_snapshot(Request::new(FetchSnapshotRequest {
+            workspace: slug.clone(),
+        }))
+        .await?
+        .into_inner();
+    let snapshot: WorkspaceSnapshot = serde_json::from_slice(&resp.snapshot_json)?;
+    apply_snapshot(&target, &snapshot)?;
+    println!(
+        "lit clone: downloaded {} version {} into {}",
+        slug,
+        resp.stored_version,
+        target.display()
+    );
+    let on_args = OnArgs {
+        path: Some(target.clone()),
+        vm_config: None,
+        name: Some(slug),
+    };
+    run_on(on_args).await?;
+    Ok(())
+}
+
+fn prepare_clone_target(target: &Path) -> anyhow::Result<()> {
+    if target.exists() {
+        if target.is_file() {
+            return Err(anyhow!("clone target {} is a file", target.display()));
+        }
+        if std::fs::read_dir(target)?.next().is_some() {
+            return Err(anyhow!("clone target {} must be empty", target.display()));
+        }
+    } else {
+        std::fs::create_dir_all(target)?;
+    }
+    Ok(())
 }
 
 async fn run_start(args: StartArgs) -> anyhow::Result<()> {
@@ -378,35 +442,379 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn daemon_sync_loop(remote: String, interval: u64) -> anyhow::Result<()> {
-    loop {
-        sync_all_workspaces(&remote).await?;
-        sleep(Duration::from_secs(interval)).await;
+struct SnapshotStreamPublisher {
+    sender: mpsc::Sender<PublishSnapshotRequest>,
+}
+
+impl SnapshotStreamPublisher {
+    async fn connect(remote: &str) -> anyhow::Result<Self> {
+        let mut client = relay_client(remote).await?;
+        let (tx, rx) = mpsc::channel(32);
+        let stream = ReceiverStream::new(rx);
+        let mut responses = client
+            .publish_snapshot_stream(stream)
+            .await
+            .context("failed to open publish snapshot stream")?
+            .into_inner();
+        tokio::spawn(async move {
+            loop {
+                match responses.message().await {
+                    Ok(Some(ack)) => info!(
+                        workspace = %ack.workspace,
+                        version = ack.stored_version,
+                        "publish stream acknowledged snapshot"
+                    ),
+                    Ok(None) => {
+                        warn!("publish snapshot stream completed");
+                        break;
+                    }
+                    Err(status) => {
+                        warn!("publish snapshot stream error: {status}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self { sender: tx })
+    }
+
+    async fn publish(&self, req: PublishSnapshotRequest) -> anyhow::Result<()> {
+        self.sender
+            .send(req)
+            .await
+            .context("publish snapshot stream closed")?;
+        Ok(())
     }
 }
 
-async fn sync_all_workspaces(remote: &str) -> anyhow::Result<()> {
+struct DirtyWorkspaceWatcher {
+    ctx: WorkspaceContext,
+    flag_path: PathBuf,
+    last_mtime: Option<SystemTime>,
+    last_signal_at: Option<Instant>,
+}
+
+impl DirtyWorkspaceWatcher {
+    fn new(ctx: WorkspaceContext) -> Self {
+        let flag_path = dirty_flag_path(&ctx.root);
+        ensure_dirty_flag_file(&flag_path);
+        Self {
+            ctx,
+            flag_path,
+            last_mtime: None,
+            last_signal_at: None,
+        }
+    }
+
+    fn refresh_context(&mut self, ctx: WorkspaceContext) {
+        self.ctx = ctx;
+        self.flag_path = dirty_flag_path(&self.ctx.root);
+        ensure_dirty_flag_file(&self.flag_path);
+    }
+
+    fn poll_flag(&mut self) {
+        match std::fs::metadata(&self.flag_path) {
+            Ok(meta) => {
+                if let Ok(modified) = meta.modified() {
+                    let newer = self.last_mtime.map(|prev| modified > prev).unwrap_or(true);
+                    if newer {
+                        self.last_mtime = Some(modified);
+                        self.last_signal_at = Some(Instant::now());
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn should_flush(&self, window: Duration) -> bool {
+        self.last_signal_at
+            .map(|instant| instant.elapsed() >= window)
+            .unwrap_or(false)
+    }
+
+    fn mark_flushed(&mut self) {
+        self.last_signal_at = None;
+    }
+
+    fn defer(&mut self) {
+        self.last_signal_at = Some(Instant::now());
+    }
+}
+
+struct DirtyWorkspaceManager {
+    watchers: HashMap<String, DirtyWorkspaceWatcher>,
+    coalesce: Duration,
+}
+
+impl DirtyWorkspaceManager {
+    fn new(coalesce: Duration) -> Self {
+        Self {
+            watchers: HashMap::new(),
+            coalesce,
+        }
+    }
+
+    fn refresh(&mut self, contexts: &[WorkspaceContext]) {
+        let active: HashSet<String> = contexts.iter().map(|c| c.slug.clone()).collect();
+        self.watchers.retain(|slug, _| active.contains(slug));
+        for ctx in contexts {
+            self.watchers
+                .entry(ctx.slug.clone())
+                .and_modify(|watcher| watcher.refresh_context(ctx.clone()))
+                .or_insert_with(|| DirtyWorkspaceWatcher::new(ctx.clone()));
+        }
+    }
+
+    fn poll_flags(&mut self) {
+        for watcher in self.watchers.values_mut() {
+            watcher.poll_flag();
+        }
+    }
+
+    async fn flush_due(&mut self, publisher: &SnapshotStreamPublisher) -> anyhow::Result<()> {
+        let ready: Vec<String> = self
+            .watchers
+            .iter()
+            .filter_map(|(id, watcher)| {
+                if watcher.should_flush(self.coalesce) {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for slug in ready {
+            if let Some(watcher) = self.watchers.get_mut(&slug) {
+                match is_path_mounted(&watcher.ctx.mountpoint) {
+                    Ok(false) => {
+                        watcher.defer();
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!(
+                            workspace = %watcher.ctx.slug,
+                            "mount check failed: {err}"
+                        );
+                        watcher.defer();
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                match publish_workspace_snapshot(&watcher.ctx, publisher).await {
+                    Ok(_) => watcher.mark_flushed(),
+                    Err(err) => {
+                        warn!(
+                            workspace = %watcher.ctx.slug,
+                            "failed to publish snapshot: {err}"
+                        );
+                        watcher.defer();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct RemoteSnapshotManager {
+    remote: String,
+    tasks: HashMap<String, JoinHandle<()>>,
+}
+
+impl RemoteSnapshotManager {
+    fn new(remote: String) -> Self {
+        Self {
+            remote,
+            tasks: HashMap::new(),
+        }
+    }
+
+    async fn reconcile(&mut self, contexts: &[WorkspaceContext]) {
+        let active: HashSet<String> = contexts.iter().map(|c| c.slug.clone()).collect();
+        let mut to_remove = Vec::new();
+        for key in self.tasks.keys() {
+            if !active.contains(key) {
+                to_remove.push(key.clone());
+            }
+        }
+        for key in to_remove {
+            if let Some(handle) = self.tasks.remove(&key) {
+                handle.abort();
+            }
+        }
+        for ctx in contexts {
+            if self.tasks.contains_key(&ctx.slug) {
+                continue;
+            }
+            let remote = self.remote.clone();
+            let ctx_clone = ctx.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(err) = run_remote_subscription(remote, ctx_clone).await {
+                    warn!("remote subscribe task stopped: {err}");
+                }
+            });
+            self.tasks.insert(ctx.slug.clone(), handle);
+        }
+    }
+}
+
+async fn daemon_sync_loop(remote: String, interval: u64) -> anyhow::Result<()> {
+    let publisher = SnapshotStreamPublisher::connect(&remote).await?;
+    let mut dirty_manager = DirtyWorkspaceManager::new(Duration::from_secs(DIRTY_COALESCE_SECS));
+    let mut remote_manager = RemoteSnapshotManager::new(remote.clone());
+    let mut contexts = discover_active_workspaces().await?;
+    dirty_manager.refresh(&contexts);
+    remote_manager.reconcile(&contexts).await;
+    let rescan_interval = Duration::from_secs(interval.max(1));
+    let mut last_rescan = Instant::now();
+    loop {
+        if last_rescan.elapsed() >= rescan_interval {
+            contexts = discover_active_workspaces().await?;
+            dirty_manager.refresh(&contexts);
+            remote_manager.reconcile(&contexts).await;
+            last_rescan = Instant::now();
+        }
+        dirty_manager.poll_flags();
+        if let Err(err) = dirty_manager.flush_due(&publisher).await {
+            warn!("lit daemon: flush error: {err}");
+        }
+        sleep(Duration::from_millis(DIRTY_POLL_INTERVAL_MS)).await;
+    }
+}
+
+fn list_workspace_mountpoints() -> anyhow::Result<Vec<PathBuf>> {
+    let mut mounts = Vec::new();
     let root = lit_home_dir()?.join("workspaces");
     if !root.exists() {
-        return Ok(());
+        return Ok(mounts);
     }
-    for entry in std::fs::read_dir(root)? {
+    for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
         if !entry.path().is_dir() {
             continue;
         }
-        let sync_args = SyncArgs {
-            remote: remote.to_string(),
-            token: None,
-            node_id: None,
-            file: None,
-            blob: false,
-            repeat: None,
-        };
-        if let Err(err) = run_sync_once(&sync_args).await {
-            eprintln!("lit daemon: sync error: {err}");
+        if let Some(vm_state) = read_vm_state(&entry.path())? {
+            mounts.push(vm_state.mountpoint);
+            continue;
+        }
+        let meta_path = entry.path().join("workspace.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&meta_path)?;
+        if let Ok(cfg) = serde_json::from_slice::<WorkspaceConfig>(&bytes) {
+            mounts.push(cfg.mountpoint);
         }
     }
+    Ok(mounts)
+}
+
+async fn discover_active_workspaces() -> anyhow::Result<Vec<WorkspaceContext>> {
+    let mounts = list_workspace_mountpoints()?;
+    let mut contexts = Vec::new();
+    for mount in mounts {
+        match workspace_context_from_mount(mount.clone()).await {
+            Ok(ctx) => {
+                if is_path_mounted(&ctx.mountpoint)? {
+                    contexts.push(ctx);
+                }
+            }
+            Err(err) => {
+                warn!(
+                    path = %mount.display(),
+                    "failed to load workspace context: {err}"
+                );
+            }
+        }
+    }
+    Ok(contexts)
+}
+
+async fn publish_workspace_snapshot(
+    ctx: &WorkspaceContext,
+    publisher: &SnapshotStreamPublisher,
+) -> anyhow::Result<()> {
+    if !is_path_mounted(&ctx.mountpoint)? {
+        return Ok(());
+    }
+    let snapshot = build_snapshot(&ctx.slug, &ctx.mountpoint)?;
+    let bytes = serde_json::to_vec(&snapshot)?;
+    let hash = file_hash(&bytes);
+    let size_bytes = bytes.len() as u64;
+    let req = PublishSnapshotRequest {
+        workspace: ctx.slug.clone(),
+        node_id: hostname(),
+        snapshot_json: bytes,
+        size_bytes,
+        hash,
+    };
+    publisher.publish(req).await?;
+    Ok(())
+}
+
+async fn run_remote_subscription(remote: String, ctx: WorkspaceContext) -> anyhow::Result<()> {
+    loop {
+        match subscribe_once(&remote, &ctx).await {
+            Ok(_) => {
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => {
+                warn!(
+                    workspace = %ctx.slug,
+                    "remote subscribe error: {err}"
+                );
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn subscribe_once(remote: &str, ctx: &WorkspaceContext) -> anyhow::Result<()> {
+    let mut client = relay_client(remote).await?;
+    let mut last_version = latest_remote_version(&ctx.root)?;
+    let request = SubscribeSnapshotsRequest {
+        workspace: ctx.slug.clone(),
+        from_version: last_version,
+    };
+    let mut stream = client
+        .subscribe_snapshots(Request::new(request))
+        .await?
+        .into_inner();
+    while let Some(envelope) = stream.message().await? {
+        if envelope.version <= last_version {
+            continue;
+        }
+        if let Err(err) = apply_remote_snapshot(ctx, &envelope) {
+            warn!(
+                workspace = %ctx.slug,
+                version = envelope.version,
+                "failed to apply remote snapshot: {err}"
+            );
+        } else {
+            last_version = envelope.version;
+        }
+    }
+    Ok(())
+}
+
+fn apply_remote_snapshot(
+    ctx: &WorkspaceContext,
+    envelope: &SnapshotEnvelope,
+) -> anyhow::Result<()> {
+    if !is_path_mounted(&ctx.mountpoint)? {
+        return Err(anyhow!("workspace mountpoint is offline"));
+    }
+    let snapshot: state_sync::WorkspaceSnapshot = serde_json::from_slice(&envelope.snapshot_json)?;
+    state_sync::apply_snapshot(&ctx.mountpoint, &snapshot)?;
+    persist_local_snapshot(&ctx.root, &snapshot)?;
+    archive_remote_snapshot(&ctx.root, envelope.version, &envelope.snapshot_json)?;
+    info!(
+        workspace = %ctx.slug,
+        version = envelope.version,
+        bytes = envelope.size_bytes,
+        "applied remote snapshot"
+    );
     Ok(())
 }
 
@@ -414,149 +822,157 @@ async fn sync_all_workspaces(remote: &str) -> anyhow::Result<()> {
 #[allow(dead_code)]
 struct WorkspaceConfig {
     workspace_id: String,
+    #[serde(default)]
+    slug: Option<String>,
     mountpoint: PathBuf,
     lower: PathBuf,
     upper: PathBuf,
     work: PathBuf,
 }
 
-async fn run_ls() -> anyhow::Result<()> {
-    let root = lit_home_dir()?.join("workspaces");
-    if !root.exists() {
-        println!("lit ls: no workspaces");
+async fn run_ls(args: LsArgs) -> anyhow::Result<()> {
+    let locals = collect_local_workspace_lines()?;
+    println!("Local workspaces:");
+    if locals.is_empty() {
+        println!("  (none)");
+    } else {
+        for line in locals {
+            println!("  {line}");
+        }
+    }
+    if args.local_only {
         return Ok(());
     }
-    let mut found = false;
-    for entry in std::fs::read_dir(&root)? {
-        let entry = entry?;
-        let meta_path = entry.path().join("workspace.json");
-        if !meta_path.exists() {
-            continue;
-        }
-        let bytes = std::fs::read(&meta_path)?;
-        if let Ok(cfg) = serde_json::from_slice::<WorkspaceConfig>(&bytes) {
-            if is_path_mounted(&cfg.mountpoint)? {
-                found = true;
-                println!("{} -> {}", cfg.workspace_id, cfg.mountpoint.display());
+    println!("\nRelay workspaces (@ {}):", args.remote);
+    match list_remote_workspaces(&args.remote).await {
+        Ok(remotes) => {
+            if remotes.is_empty() {
+                println!("  (none)");
+            } else {
+                for line in remotes {
+                    println!("  {line}");
+                }
             }
         }
-    }
-    if !found {
-        println!("lit ls: no mounted workspaces");
+        Err(err) => {
+            eprintln!("lit ls: failed to list relay {}: {err}", args.remote);
+        }
     }
     Ok(())
+}
+
+fn collect_local_workspace_lines() -> anyhow::Result<Vec<String>> {
+    let root = lit_home_dir()?.join("workspaces");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if let Some(vm_state) = read_vm_state(&entry_path)? {
+            let mounted = is_path_mounted(&vm_state.mountpoint)?;
+            let status = if mounted { "ON" } else { "OFF" };
+            lines.push(format!(
+                "{} [{status}] -> {} (vm {}:{})",
+                vm_state.config.workspace,
+                vm_state.mountpoint.display(),
+                vm_state.config.host,
+                vm_state.config.workspace
+            ));
+            continue;
+        }
+        let cfg = match read_workspace_config(&entry_path) {
+            Ok(cfg) => cfg,
+            Err(_) => continue,
+        };
+        let mounted = is_path_mounted(&cfg.mountpoint)?;
+        let status = if mounted { "ON" } else { "OFF" };
+        let slug = cfg.slug.clone().unwrap_or_else(|| cfg.workspace_id.clone());
+        lines.push(format!(
+            "{} [{status}] -> {}",
+            slug,
+            cfg.mountpoint.display()
+        ));
+    }
+    lines.sort();
+    Ok(lines)
+}
+
+async fn list_remote_workspaces(remote: &str) -> anyhow::Result<Vec<String>> {
+    let mut client = relay_client(remote).await?;
+    let resp = client
+        .list_workspaces(Request::new(ListWorkspacesRequest {}))
+        .await?
+        .into_inner();
+    let mut lines = Vec::new();
+    for ws in resp.workspaces {
+        let ts = if ws.updated_at == 0 {
+            "-".to_string()
+        } else {
+            let secs = ws.updated_at as i64;
+            match chrono::DateTime::<Utc>::from_timestamp(secs, 0) {
+                Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                None => ws.updated_at.to_string(),
+            }
+        };
+        lines.push(format!(
+            "{} v{} (updated {})",
+            ws.workspace, ws.latest_version, ts
+        ));
+    }
+    lines.sort();
+    Ok(lines)
 }
 
 async fn run_sync_once(args: &SyncArgs) -> anyhow::Result<()> {
     let mut client = relay_client(&args.remote).await?;
-    let host = hostname();
-    let node_id = args
-        .node_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{}", host, Uuid::new_v4()));
-    let mut open_req = Request::new(OpenSessionRequest {
-        node_id: node_id.clone(),
-        host: host.clone(),
-        crdt_version: "1.0".into(),
-        local_vector: None,
-        auth_token: args.token.clone().unwrap_or_default(),
-    });
-    attach_auth(&mut open_req, args.token.as_deref())?;
-    let session = client.open_session(open_req).await?.into_inner();
-    println!("session: {}", session.session_id);
-
-    let (tx, rx) = mpsc::channel::<OperationEnvelope>(8);
-    let outbound = ReceiverStream::new(rx);
-    let mut stream_req = Request::new(outbound);
-    attach_auth(&mut stream_req, args.token.as_deref())?;
-    let mut ack_stream = client.stream_ops(stream_req).await?.into_inner();
-
-    if let Some(path) = args.file.clone() {
-        let data = fs::read(&path)
-            .await
-            .with_context(|| format!("failed to read {:?}", path))?;
-        let media_type = mime_string(&path);
-        let op = Operation {
-            op_id: 0,
-            file_path: path.to_string_lossy().into_owned(),
-            payload: data,
-            media_type,
-            is_blob: args.blob,
-            timestamp: unix_timestamp(),
-        };
-        let envelope = OperationEnvelope {
-            session_id: session.session_id.clone(),
-            payload: Some(Payload::Operation(op)),
-            checksum: vec![],
-        };
-        tx.send(envelope).await.unwrap();
+    let ctx = workspace_context_from_arg(Some(args.workspace.clone())).await?;
+    if !is_path_mounted(&ctx.mountpoint)? {
+        return Err(anyhow!(
+            "workspace {} is not mounted",
+            ctx.mountpoint.display()
+        ));
     }
-    drop(tx);
-
-    while let Some(ack) = ack_stream.message().await? {
-        println!("ack seq={}", ack.last_applied_op);
-    }
-
-    let mut hb_req = Request::new(HeartbeatRequest {
-        session_id: session.session_id.clone(),
-    });
-    attach_auth(&mut hb_req, args.token.as_deref())?;
-    let hb = client.heartbeat(hb_req).await?.into_inner();
-    println!("heartbeat status: {}", hb.status);
-
-    let mut list_req = Request::new(ListRefsRequest {
-        session_id: session.session_id.clone(),
-    });
-    attach_auth(&mut list_req, args.token.as_deref())?;
-    let refs = client.list_refs(list_req).await?.into_inner();
+    let snapshot = build_snapshot(&ctx.slug, &ctx.mountpoint)?;
+    let bytes = serde_json::to_vec(&snapshot)?;
+    let hash = file_hash(&bytes);
+    let publish_req = PublishSnapshotRequest {
+        workspace: ctx.slug.clone(),
+        node_id: hostname(),
+        snapshot_json: bytes.clone(),
+        size_bytes: bytes.len() as u64,
+        hash: hash.clone(),
+    };
+    let publish_resp = client
+        .publish_snapshot(Request::new(publish_req))
+        .await?
+        .into_inner();
     println!(
-        "labels={}, snapshots={}, blobs={}",
-        refs.labels.len(),
-        refs.snapshots.len(),
-        refs.blobs.len()
+        "lit sync: published snapshot {} {} ({} bytes)",
+        ctx.slug,
+        publish_resp.stored_version,
+        bytes.len()
     );
-    Ok(())
-}
 
-async fn run_blob_fetch(args: BlobFetchArgs) -> anyhow::Result<()> {
-    let mut client = relay_client(&args.remote).await?;
-    let host = hostname();
-    let node_id = args
-        .node_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{}", host, Uuid::new_v4()));
-    let mut open_req = Request::new(OpenSessionRequest {
-        node_id,
-        host,
-        crdt_version: "1.0".into(),
-        local_vector: None,
-        auth_token: args.token.clone().unwrap_or_default(),
-    });
-    attach_auth(&mut open_req, args.token.as_deref())?;
-    let session = client.open_session(open_req).await?.into_inner();
-
-    let mut fetch_req = Request::new(FetchBlobRequest {
-        session_id: session.session_id,
-        path: args.path.clone(),
-        version_id: args.version_id.clone(),
-    });
-    attach_auth(&mut fetch_req, args.token.as_deref())?;
-    let resp = client.fetch_blob(fetch_req).await?.into_inner();
-    fs::write(&args.output, &resp.data)
-        .await
-        .with_context(|| format!("failed to write {:?}", args.output))?;
+    let fetch_resp = client
+        .fetch_snapshot(Request::new(FetchSnapshotRequest {
+            workspace: ctx.slug.clone(),
+        }))
+        .await?
+        .into_inner();
+    let inbox = ctx.root.join("state").join("inbox");
+    std::fs::create_dir_all(&inbox)?;
+    let inbox_file = inbox.join(format!("remote-{:020}.json", fetch_resp.stored_version));
+    std::fs::write(&inbox_file, &fetch_resp.snapshot_json)?;
     println!(
-        "wrote {} bytes to {}",
-        resp.data.len(),
-        args.output.to_string_lossy()
+        "lit sync: fetched snapshot {} {} ({} bytes)",
+        ctx.slug, fetch_resp.stored_version, fetch_resp.size_bytes
     );
-    Ok(())
-}
-
-fn attach_auth<T>(req: &mut Request<T>, token: Option<&str>) -> anyhow::Result<()> {
-    if let Some(token) = token {
-        let value = MetadataValue::try_from(format!("Bearer {token}"))?;
-        req.metadata_mut().insert("authorization", value);
+    match apply_incoming_snapshots(&ctx.root, &ctx.mountpoint) {
+        Ok(0) => {}
+        Ok(applied) => println!("lit sync: applied {applied} incoming snapshot(s)"),
+        Err(err) => eprintln!("lit sync: failed to apply incoming snapshots: {err}"),
     }
     Ok(())
 }
@@ -571,13 +987,6 @@ async fn relay_client(remote: &str) -> anyhow::Result<RelayServiceClient<Channel
         .await
         .context("failed to connect to relay")?;
     Ok(RelayServiceClient::new(channel))
-}
-
-fn mime_string(path: &PathBuf) -> String {
-    MimeGuess::from_path(path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string()
 }
 
 fn unix_timestamp() -> i64 {
@@ -597,6 +1006,20 @@ async fn run_status(target: Option<PathBuf>) -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
     let canonical = fs::canonicalize(&base).await.unwrap_or(base.clone());
+    let workspace_id = workspace_id(&canonical).await?;
+    let workspace_root = lit_home_dir()?.join("workspaces").join(&workspace_id);
+    if let Some(state) = read_vm_state(&workspace_root)? {
+        let status = if is_path_mounted(&canonical)? {
+            "ON"
+        } else {
+            "OFF"
+        };
+        println!("lit status (vm): {}", status);
+        println!(" mountpoint: {}", canonical.display());
+        println!(" remote host: {}", state.config.host);
+        println!(" remote workspace: {}", state.config.workspace);
+        return Ok(());
+    }
     match workspace_context_from_mount(canonical.clone()).await {
         Ok(ctx) => {
             let state = if is_path_mounted(&ctx.mountpoint)? {
@@ -605,7 +1028,7 @@ async fn run_status(target: Option<PathBuf>) -> anyhow::Result<()> {
                 "OFF"
             };
             println!("lit status: {}", state);
-            println!(" workspace: {}", ctx.workspace_id);
+            println!(" workspace: {}", ctx.slug);
             println!(" mountpoint: {}", ctx.mountpoint.display());
             println!(" lower: {}", ctx.lower.display());
             println!(" upper: {}", ctx.upper.display());
@@ -642,21 +1065,36 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     };
     let canonical_target = fs::canonicalize(&target).await.unwrap_or(target.clone());
     ensure_dir(&canonical_target).await?;
-    ensure_fuse_overlayfs()?;
+    let workspace_id = workspace_id(&canonical_target).await?;
+    let vm_cfg_path = args
+        .vm_config
+        .or_else(|| env::var("LIT_VM_CONFIG").ok().map(PathBuf::from));
+    if let Some(cfg_path) = vm_cfg_path {
+        run_on_vm(&canonical_target, &workspace_id, &cfg_path)?;
+        return Ok(());
+    }
+
+    let slug = match &args.name {
+        Some(name) => sanitize_slug(name)?,
+        None => default_slug_from_path(&canonical_target)?,
+    };
 
     let lit_home = lit_home_dir()?;
     let workspaces_root = lit_home.join("workspaces");
     fs::create_dir_all(&workspaces_root).await?;
 
-    let workspace_id = workspace_id(&canonical_target).await?;
     let workspace_root = workspaces_root.join(&workspace_id);
     let lower = workspace_root.join("lower");
     let upper = workspace_root.join("upper");
     let work = workspace_root.join("work");
+    let state_dir = workspace_root.join("state");
     let workspace_exists = workspace_root.exists();
     fs::create_dir_all(&lower).await?;
     fs::create_dir_all(&upper).await?;
     fs::create_dir_all(&work).await?;
+    fs::create_dir_all(&state_dir).await?;
+    let dirty_flag = state_dir.join("dirty.flag");
+    ensure_dirty_flag_file(&dirty_flag);
 
     if !workspace_exists {
         save_watchlist_scope(&workspace_root, WatchScope::Global, &HashSet::new())?;
@@ -668,13 +1106,14 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
         &workspace_root,
         &canonical_target,
         &workspace_id,
+        &slug,
         &lower,
         &upper,
         &work,
     )?;
 
     let locks_file = workspace_root.join("locks.json");
-    spawn_lit_fs_daemon(&upper, &canonical_target, &locks_file)?;
+    spawn_lit_fs_daemon(&upper, &canonical_target, &locks_file, &dirty_flag)?;
     mount::write_state(
         &workspace_root,
         &mount::MountState {
@@ -685,7 +1124,7 @@ async fn run_on(args: OnArgs) -> anyhow::Result<()> {
     wait_for_mount(&canonical_target).await?;
     println!(
         "lit: mounted workspace {} at {}",
-        workspace_id,
+        slug,
         canonical_target.to_string_lossy()
     );
     println!(
@@ -703,22 +1142,18 @@ async fn run_off(args: OffArgs) -> anyhow::Result<()> {
     let canonical = fs::canonicalize(&target).await.unwrap_or(target.clone());
     let workspace_id = workspace_id(&canonical).await?;
     let workspace_root = lit_home_dir()?.join("workspaces").join(&workspace_id);
+    let vm_cfg_path = args
+        .vm_config
+        .or_else(|| env::var("LIT_VM_CONFIG").ok().map(PathBuf::from));
+    if vm_cfg_path.is_some() || vm_state_path(&workspace_root).exists() {
+        run_off_vm(&canonical, &workspace_id, vm_cfg_path)?;
+        return Ok(());
+    }
     if !workspace_root.exists() {
         return Err(anyhow!("{} is not a lit workspace", canonical.display()));
     }
     let upper = workspace_root.join("upper");
-    let status = Command::new("fusermount3")
-        .arg("-u")
-        .arg(&canonical)
-        .status()
-        .map_err(|e| anyhow!("failed to run fusermount3: {e}"))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "fusermount3 exited with status {} for {}",
-            status,
-            canonical.display()
-        ));
-    }
+    unmount_path(&canonical)?;
     sync_upper_to_target(&upper, &canonical)?;
     mount::clear_state(&workspace_root)?;
     println!("lit: unmounted {}", canonical.display());
@@ -732,21 +1167,15 @@ async fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_fuse_overlayfs() -> anyhow::Result<()> {
-    which::which("fuse-overlayfs")
-        .map(|_| ())
-        .map_err(|_| anyhow!("fuse-overlayfs not found; install fuse-overlayfs package"))
-}
-
 async fn wait_for_mount(path: &Path) -> anyhow::Result<()> {
-    for _ in 0..20 {
+    for _ in 0..50 {
         if is_path_mounted(path)? {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
     }
     Err(anyhow!(
-        "timed out waiting for fuse-overlayfs to mount {}",
+        "timed out waiting for lit-fs to mount {}",
         path.display()
     ))
 }
@@ -760,6 +1189,41 @@ async fn workspace_id(path: &Path) -> anyhow::Result<String> {
     Ok(hasher.finalize().encode_hex::<String>())
 }
 
+fn sanitize_slug(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("workspace name must not be empty"));
+    }
+    let mut slug = String::new();
+    for ch in trimmed.chars() {
+        match ch {
+            'a'..='z' | '0'..='9' | '-' | '_' => slug.push(ch),
+            'A'..='Z' => slug.push(ch.to_ascii_lowercase()),
+            ' ' | '.' | '/' | '\\' => slug.push('-'),
+            _ => {
+                return Err(anyhow!(
+                    "workspace name may only contain [a-z0-9-_]; got '{ch}'"
+                ))
+            }
+        }
+    }
+    if slug.is_empty() {
+        return Err(anyhow!("workspace name became empty after sanitization"));
+    }
+    Ok(slug)
+}
+
+fn default_slug_from_path(path: &Path) -> anyhow::Result<String> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        sanitize_slug(name)
+    } else {
+        Err(anyhow!(
+            "cannot derive workspace name from {}",
+            path.display()
+        ))
+    }
+}
+
 fn lit_home_dir() -> anyhow::Result<PathBuf> {
     let home = home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let lit_home = home.join(".lit");
@@ -767,12 +1231,13 @@ fn lit_home_dir() -> anyhow::Result<PathBuf> {
     Ok(lit_home)
 }
 
+#[derive(Clone)]
 struct WorkspaceContext {
     mountpoint: PathBuf,
-    workspace_id: String,
     root: PathBuf,
     lower: PathBuf,
     upper: PathBuf,
+    slug: String,
 }
 
 async fn workspace_context_from_arg(path: Option<PathBuf>) -> anyhow::Result<WorkspaceContext> {
@@ -792,14 +1257,30 @@ async fn workspace_context_from_mount(mountpoint: PathBuf) -> anyhow::Result<Wor
     } else {
         let lower = root.join("lower");
         let upper = root.join("upper");
+        let slug =
+            workspace_slug_from_root(&root, &mountpoint).unwrap_or_else(|_| workspace_id.clone());
         Ok(WorkspaceContext {
             mountpoint,
-            workspace_id,
             root,
             lower,
             upper,
+            slug,
         })
     }
+}
+
+fn dirty_flag_path(root: &Path) -> PathBuf {
+    root.join("state").join("dirty.flag")
+}
+
+fn ensure_dirty_flag_file(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"0\n");
 }
 
 fn move_existing_contents(source: &Path, lower: &Path) -> anyhow::Result<()> {
@@ -988,6 +1469,7 @@ fn write_workspace_config(
     root: &Path,
     mountpoint: &Path,
     workspace_id: &str,
+    slug: &str,
     lower: &Path,
     upper: &Path,
     work: &Path,
@@ -996,6 +1478,7 @@ fn write_workspace_config(
     let config_path = root.join("workspace.json");
     let payload = json!({
         "workspace_id": workspace_id,
+        "slug": slug,
         "mountpoint": mountpoint,
         "lower": lower,
         "upper": upper,
@@ -1006,18 +1489,86 @@ fn write_workspace_config(
     Ok(())
 }
 
-fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
-    match Command::new("mountpoint").arg("-q").arg(path).status() {
-        Ok(status) => Ok(status.success()),
-        Err(_) => {
-            let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
-            let display = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            Ok(mounts.contains(display.to_string_lossy().as_ref()))
+fn workspace_config_path(root: &Path) -> PathBuf {
+    root.join("workspace.json")
+}
+
+fn read_workspace_config(root: &Path) -> anyhow::Result<WorkspaceConfig> {
+    let path = workspace_config_path(root);
+    let bytes = std::fs::read(&path)?;
+    let cfg = serde_json::from_slice::<WorkspaceConfig>(&bytes)?;
+    Ok(cfg)
+}
+
+fn workspace_slug_from_root(root: &Path, mountpoint: &Path) -> anyhow::Result<String> {
+    match read_workspace_config(root) {
+        Ok(cfg) => {
+            if let Some(slug) = cfg.slug {
+                Ok(slug)
+            } else {
+                default_slug_from_path(mountpoint)
+            }
+        }
+        Err(err) => {
+            if err
+                .downcast_ref::<std::io::Error>()
+                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false)
+            {
+                default_slug_from_path(mountpoint)
+            } else {
+                Err(err)
+            }
         }
     }
 }
 
-fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path, locks_file: &Path) -> anyhow::Result<()> {
+#[cfg(target_os = "linux")]
+fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
+    const FUSE_SUPER_MAGIC: libc::c_long = 0x65735546;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let res = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    if res != 0 {
+        return Err(anyhow!(
+            "statfs failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(stat.f_type == FUSE_SUPER_MAGIC)
+}
+
+#[cfg(target_os = "macos")]
+fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let res = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    if res != 0 {
+        return Err(anyhow!(
+            "statfs failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fs_name = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+    Ok(fs_name.to_string_lossy().to_lowercase().contains("fuse"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_path_mounted(path: &Path) -> anyhow::Result<bool> {
+    match Command::new("mountpoint").arg("-q").arg(path).status() {
+        Ok(status) => Ok(status.success()),
+        Err(err) => Err(anyhow!("failed to check mount status: {err}")),
+    }
+}
+
+fn spawn_lit_fs_daemon(
+    source: &Path,
+    mountpoint: &Path,
+    locks_file: &Path,
+    dirty_flag: &Path,
+) -> anyhow::Result<()> {
     let bin = which::which("lit-fs").context("lit-fs binary not found")?;
     std::fs::create_dir_all(source)?;
     Command::new(bin)
@@ -1027,9 +1578,42 @@ fn spawn_lit_fs_daemon(source: &Path, mountpoint: &Path, locks_file: &Path) -> a
         .arg(mountpoint)
         .arg("--locks-file")
         .arg(locks_file)
+        .arg("--dirty-flag")
+        .arg(dirty_flag)
         .spawn()
         .map(|_| ())
         .map_err(|e| anyhow!("failed to spawn lit-fs: {e}"))
+}
+
+fn unmount_path(target: &Path) -> anyhow::Result<()> {
+    let mut last_error = None;
+    let commands = vec![
+        ("fusermount3", vec!["-u"]),
+        ("fusermount", vec!["-u"]),
+        ("umount", Vec::<&str>::new()),
+        ("diskutil", vec!["umount"]),
+    ];
+    for (cmd, args) in commands {
+        match which::which(cmd) {
+            Ok(path) => {
+                let status = Command::new(path).args(&args).arg(target).status();
+                match status {
+                    Ok(status) if status.success() => return Ok(()),
+                    Ok(status) => {
+                        last_error = Some(anyhow!("{} exited with status {}", cmd, status))
+                    }
+                    Err(err) => last_error = Some(anyhow!("failed to run {}: {err}", cmd)),
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "no supported unmount command found for {}",
+            target.display()
+        )
+    }))
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1040,6 +1624,42 @@ struct WatchState {
 struct WatchLists {
     global: HashSet<String>,
     session: HashSet<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct VmConfig {
+    host: String,
+    workspace: String,
+    #[serde(default = "default_vm_lit_root")]
+    lit_root: String,
+    #[serde(default = "default_vm_export_file")]
+    export_file: String,
+    #[serde(default = "default_vm_mount_options")]
+    mount_options: String,
+    #[serde(default = "default_vm_install_nfs")]
+    install_nfs: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct VmWorkspaceState {
+    config: VmConfig,
+    mountpoint: PathBuf,
+}
+
+fn default_vm_lit_root() -> String {
+    "~/lit".to_string()
+}
+
+fn default_vm_export_file() -> String {
+    "/etc/exports.d/lit-vm.exports".to_string()
+}
+
+fn default_vm_mount_options() -> String {
+    "vers=4".to_string()
+}
+
+fn default_vm_install_nfs() -> bool {
+    true
 }
 
 enum WatchScope<'a> {
@@ -1073,6 +1693,226 @@ fn combined_watchlist(lists: &WatchLists) -> HashSet<String> {
     let mut set = lists.global.clone();
     set.extend(lists.session.iter().cloned());
     set
+}
+
+fn load_vm_config(path: &Path) -> anyhow::Result<VmConfig> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read vm config {}", path.display()))?;
+    let config: VmConfig = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid vm config {}", path.display()))?;
+    Ok(config)
+}
+
+fn vm_state_path(root: &Path) -> PathBuf {
+    root.join("vm.json")
+}
+
+fn save_vm_state(root: &Path, state: &VmWorkspaceState) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let path = vm_state_path(root);
+    std::fs::write(&path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+fn read_vm_state(root: &Path) -> anyhow::Result<Option<VmWorkspaceState>> {
+    let path = vm_state_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)?;
+    let state = serde_json::from_slice(&bytes)?;
+    Ok(Some(state))
+}
+
+fn shell_quote(input: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in input.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn run_remote(host: &str, command: &str) -> anyhow::Result<()> {
+    let status = Command::new("ssh")
+        .arg(host)
+        .arg(command)
+        .status()
+        .with_context(|| format!("failed to run ssh {host}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("ssh {host} exited with status {status}"))
+    }
+}
+
+fn run_remote_bash(host: &str, script: &str) -> anyhow::Result<()> {
+    let wrapped = format!("bash -lc {}", shell_quote(script));
+    run_remote(host, &wrapped)
+}
+
+fn run_remote_capture(host: &str, command: &str) -> anyhow::Result<String> {
+    let output = Command::new("ssh")
+        .arg(host)
+        .arg(command)
+        .output()
+        .with_context(|| format!("failed to run ssh {host}"))?;
+    if !output.status.success() {
+        return Err(anyhow!("ssh {host} exited with status {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn prepare_vm_workspace(cfg: &VmConfig) -> anyhow::Result<()> {
+    if cfg.install_nfs {
+        run_remote(
+            &cfg.host,
+            "sudo apt-get update -qq && sudo apt-get install -y nfs-kernel-server",
+        )?;
+    }
+    run_remote(
+        &cfg.host,
+        &format!("mkdir -p {}", shell_quote(&cfg.workspace)),
+    )?;
+    let lit_cmd = format!(
+        "cd {} && . $HOME/.cargo/env && (lit info {} >/dev/null 2>&1 && lit off {} || true) && lit on {}",
+        shell_quote(&cfg.lit_root),
+        shell_quote(&cfg.workspace),
+        shell_quote(&cfg.workspace),
+        shell_quote(&cfg.workspace)
+    );
+    run_remote_bash(&cfg.host, &lit_cmd)?;
+    configure_vm_export(cfg)?;
+    Ok(())
+}
+
+fn file_hash(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+fn configure_vm_export(cfg: &VmConfig) -> anyhow::Result<()> {
+    let uid = run_remote_capture(&cfg.host, "id -u")?;
+    let gid = run_remote_capture(&cfg.host, "id -g")?;
+    let export_path = Path::new(&cfg.export_file);
+    let dir = export_path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/etc".to_string());
+    run_remote(&cfg.host, &format!("sudo mkdir -p {}", shell_quote(&dir)))?;
+    let line = format!(
+        "{} *(rw,sync,no_subtree_check,all_squash,anonuid={},anongid={})",
+        &cfg.workspace, uid, gid
+    );
+    let cmd = format!(
+        "printf %s\\n {} | sudo tee {} > /dev/null",
+        shell_quote(&line),
+        shell_quote(&cfg.export_file)
+    );
+    run_remote(&cfg.host, &cmd)?;
+    run_remote(&cfg.host, "sudo exportfs -ra")?;
+    Ok(())
+}
+
+fn stop_vm_workspace(cfg: &VmConfig) -> anyhow::Result<()> {
+    let lit_cmd = format!(
+        "cd {} && . $HOME/.cargo/env && (lit info {} >/dev/null 2>&1 && lit off {} || true)",
+        shell_quote(&cfg.lit_root),
+        shell_quote(&cfg.workspace),
+        shell_quote(&cfg.workspace)
+    );
+    run_remote_bash(&cfg.host, &lit_cmd)
+}
+
+fn clear_vm_export(cfg: &VmConfig) -> anyhow::Result<()> {
+    let cmd = format!(
+        "sudo rm -f {} && sudo exportfs -ra",
+        shell_quote(&cfg.export_file)
+    );
+    run_remote(&cfg.host, &cmd)
+}
+
+fn mount_vm_workspace(cfg: &VmConfig, target: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(target)?;
+    let status = Command::new("sudo")
+        .arg("mount")
+        .arg("-t")
+        .arg("nfs")
+        .arg("-o")
+        .arg(&cfg.mount_options)
+        .arg(format!("{}:{}", cfg.host, cfg.workspace))
+        .arg(target)
+        .status()
+        .context("failed to run sudo mount")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("mount failed with status {status}"))
+    }
+}
+
+fn run_on_vm(canonical_target: &Path, workspace_id: &str, cfg_path: &Path) -> anyhow::Result<()> {
+    let cfg = load_vm_config(cfg_path)?;
+    let workspace_root = lit_home_dir()?.join("workspaces").join(workspace_id);
+    prepare_vm_workspace(&cfg)?;
+    if let Err(err) = mount_vm_workspace(&cfg, canonical_target) {
+        let _ = stop_vm_workspace(&cfg);
+        return Err(err);
+    }
+    save_vm_state(
+        &workspace_root,
+        &VmWorkspaceState {
+            config: cfg.clone(),
+            mountpoint: canonical_target.to_path_buf(),
+        },
+    )?;
+    println!(
+        "lit(vm): mounted {} from {}:{}",
+        canonical_target.display(),
+        cfg.host,
+        cfg.workspace
+    );
+    Ok(())
+}
+
+fn run_off_vm(
+    canonical_target: &Path,
+    workspace_id: &str,
+    override_cfg: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let workspace_root = lit_home_dir()?.join("workspaces").join(workspace_id);
+    let state = if let Some(path) = override_cfg {
+        VmWorkspaceState {
+            config: load_vm_config(&path)?,
+            mountpoint: canonical_target.to_path_buf(),
+        }
+    } else {
+        read_vm_state(&workspace_root)?.ok_or_else(|| {
+            anyhow!(
+                "{} is not a vm-backed lit workspace",
+                canonical_target.display()
+            )
+        })?
+    };
+    if is_path_mounted(canonical_target)? {
+        unmount_path(canonical_target)?;
+    }
+    stop_vm_workspace(&state.config)?;
+    clear_vm_export(&state.config)?;
+    let state_path = vm_state_path(&workspace_root);
+    if state_path.exists() {
+        std::fs::remove_file(state_path)?;
+    }
+    if workspace_root.exists() {
+        let _ = std::fs::remove_dir_all(&workspace_root);
+    }
+    println!("lit(vm): unmounted {}", canonical_target.display());
+    Ok(())
 }
 
 fn daemon_state_path() -> anyhow::Result<PathBuf> {
